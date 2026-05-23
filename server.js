@@ -235,6 +235,12 @@ app.patch('/api/orders/:id', async (req, res) => {
   res.json(data)
 })
 
+app.get('/api/sync', async (req, res) => {
+  await syncAll()
+  const { count } = await sb.from('ml_orders').select('*', { count: 'exact', head: true })
+  res.json({ ok: true, total: count, message: 'Sincronizado!' })
+})
+
 app.post('/api/sync', async (req, res) => {
   await syncAll()
   const { count } = await sb.from('ml_orders').select('*', { count: 'exact', head: true })
