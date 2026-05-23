@@ -85,84 +85,55 @@ async function getToken(account) {
   return account.access_token
 }
 
-// ── Sync ML orders (200 per account) ─────────────────────────────
+// ── Detect if order is FULL/Fulfillment ──────────────────────────
+function isFulfillment(order) {
+  // Check logistic type
+  const logisticType = order.shipping?.logistic_type || ''
+  const fulfillmentTypes = ['fulfillment', 'self_service', 'xd_drop_off', 'drop_off']
+  
+  // If logistic type contains fulfillment = ML embala
+  if (fulfillmentTypes.some(t => logisticType.toLowerCase().includes(t))) {
+    return true
+  }
+  
+  // Check tags
+  const tags = order.tags || []
+  if (tags.includes('fulfillment') || tags.includes('meli_fulfillment')) {
+    return true
+  }
+
+  return false
+}
+
+function getOrderType(order) {
+  const logisticType = order.shipping?.logistic_type || ''
+  if (logisticType.includes('fulfillment')) return 'FULL'
+  if (logisticType.includes('flex')) return 'FLEX'
+  if (logisticType.includes('self_service')) return 'FULL'
+  if (logisticType.includes('xd_drop_off')) return 'FULL'
+  return 'NORMAL'
+}
+
+// ── Sync ML orders ────────────────────────────────────────────────
 async function syncMLOrders(account) {
   try {
     const token = await getToken(account)
+    let totalNew = 0
 
-    // Get paid orders - increased to 200
-    const { data } = await axios.get(
-      `https://api.mercadolibre.com/orders/search/recent?seller=${account.ml_user_id}&order.status=paid&limit=200`,
-      { headers: { Authorization: `Bearer ${token}` } }
-    )
-
-    let newOrders = 0
-    for (const order of data.results || []) {
-      const { data: existing } = await sb.from('ml_orders')
-        .select('id').eq('ml_order_id', String(order.id)).maybeSingle()
-      if (existing) continue
-
-      const items = order.order_items.map(item => ({
-        sku: item.item.seller_sku || item.item.id,
-        name: item.item.title,
-        qty: item.quantity,
-        ml_item_id: item.item.id,
-        thumbnail: item.item.thumbnail
-      }))
-
-      // Get shipment tracking for barcode search
-      let shipmentId = null
-      try {
-        if (order.shipping?.id) {
-          shipmentId = String(order.shipping.id)
-        }
-      } catch(e) {}
-
-      await sb.from('ml_orders').insert({
-        ml_order_id: String(order.id),
-        account_nickname: account.nickname,
-        buyer_name: order.buyer?.nickname || order.buyer?.full_name || 'Cliente',
-        status: 'pending',
-        items: items,
-        ml_status: order.status,
-        shipment_id: shipmentId,
-        created_at_ml: order.date_created
-      })
-
-      // Auto register products
-      for (const item of items) {
-        if (item.sku) {
-          await sb.from('products').upsert({
-            sku: String(item.sku),
-            name: item.name,
-            description: `Importado ML - ${account.nickname}`,
-            photo: item.thumbnail ? item.thumbnail.replace('-I.jpg','-O.jpg').replace('http://','https://') : null,
-            active: true,
-            source: 'mercadolivre'
-          }, { onConflict: 'sku', ignoreDuplicates: true })
-        }
-      }
-      newOrders++
-    }
-    console.log(`✅ ${account.nickname}: ${newOrders} novos / ${data.results?.length || 0} total`)
-  } catch (e) {
-    console.error(`Sync error (${account.nickname}):`, e.response?.data || e.message)
-  }
-}
-
-// Also sync pending/processing orders
-async function syncAllStatuses(account) {
-  try {
-    const token = await getToken(account)
-    for (const status of ['paid', 'payment_in_process']) {
+    for (const mlStatus of ['paid', 'payment_in_process']) {
       const { data } = await axios.get(
-        `https://api.mercadolibre.com/orders/search/recent?seller=${account.ml_user_id}&order.status=${status}&limit=200`,
+        `https://api.mercadolibre.com/orders/search/recent?seller=${account.ml_user_id}&order.status=${mlStatus}&limit=200`,
         { headers: { Authorization: `Bearer ${token}` } }
       )
+
       for (const order of data.results || []) {
         const { data: existing } = await sb.from('ml_orders')
           .select('id').eq('ml_order_id', String(order.id)).maybeSingle()
         if (existing) continue
+
+        const full = isFulfillment(order)
+        const orderType = getOrderType(order)
+
         const items = order.order_items.map(item => ({
           sku: item.item.seller_sku || item.item.id,
           name: item.item.title,
@@ -170,40 +141,61 @@ async function syncAllStatuses(account) {
           ml_item_id: item.item.id,
           thumbnail: item.item.thumbnail
         }))
+
+        // FULL orders: status = 'full_ml' (ML embala, não aparece na fila)
+        // FLEX/NORMAL: status = 'aguardando' (entra na fila de embalagem)
+        const status = full ? 'full_ml' : 'aguardando'
+
         await sb.from('ml_orders').insert({
           ml_order_id: String(order.id),
           account_nickname: account.nickname,
-          buyer_name: order.buyer?.nickname || 'Cliente',
-          status: 'pending',
-          items: items,
-          ml_status: order.status,
+          buyer_name: order.buyer?.nickname || order.buyer?.full_name || 'Cliente',
+          status,
+          order_type: orderType,
+          is_fulfillment: full,
+          items,
+          ml_status: mlStatus,
           shipment_id: order.shipping?.id ? String(order.shipping.id) : null,
           created_at_ml: order.date_created
-        }).select()
+        })
+
+        // Auto register products (only for non-full orders)
+        if (!full) {
+          for (const item of items) {
+            if (item.sku) {
+              await sb.from('products').upsert({
+                sku: String(item.sku),
+                name: item.name,
+                description: `Importado ML - ${account.nickname}`,
+                photo: item.thumbnail ? item.thumbnail.replace('-I.jpg','-O.jpg').replace('http://','https://') : null,
+                active: true,
+                source: 'mercadolivre'
+              }, { onConflict: 'sku', ignoreDuplicates: true })
+            }
+          }
+        }
+        totalNew++
       }
     }
-  } catch(e) { console.error('Sync status error:', e.message) }
+    console.log(`✅ ${account.nickname}: ${totalNew} novos pedidos`)
+  } catch (e) {
+    console.error(`Sync error (${account.nickname}):`, e.response?.data || e.message)
+  }
 }
 
 async function syncAll() {
   const { data: accounts } = await sb.from('ml_accounts').select('*').eq('active', true)
   if (!accounts?.length) return
-  console.log(`🔄 Syncing ${accounts.length} accounts...`)
-  for (const acc of accounts) {
-    await syncMLOrders(acc)
-    await syncAllStatuses(acc)
-  }
+  console.log(`🔄 Sincronizando ${accounts.length} conta(s)...`)
+  for (const acc of accounts) await syncMLOrders(acc)
 }
 
-// Sync every 2 minutes
 cron.schedule('*/2 * * * *', syncAll)
 
 // ── API Routes ────────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({
-  status: '🚀 TMP10 Backend rodando!',
-  version: '2.0.0',
-  accounts_url: `${RAILWAY_URL}/api/ml/accounts`,
-  sync_url: `${RAILWAY_URL}/api/sync`
+  status: '🚀 TMP10 Backend v3.0',
+  features: ['FULL detection', '200 orders/account', 'Auto sync 2min']
 }))
 
 app.get('/api/ml/accounts', async (req, res) => {
@@ -211,10 +203,15 @@ app.get('/api/ml/accounts', async (req, res) => {
   res.json(data || [])
 })
 
+// Queue - only orders to pack (no FULL)
 app.get('/api/orders', async (req, res) => {
-  const { status, limit = 200 } = req.query
-  let q = sb.from('ml_orders').select('*').order('created_at', { ascending: false }).limit(Number(limit))
+  const { status, limit = 200, include_full } = req.query
+  let q = sb.from('ml_orders').select('*').order('created_at_ml', { ascending: true }).limit(Number(limit))
+  
+  // By default exclude FULL orders from queue
+  if (!include_full) q = q.neq('status', 'full_ml')
   if (status) q = q.eq('status', status)
+  
   const { data } = await q
   res.json(data || [])
 })
@@ -222,7 +219,7 @@ app.get('/api/orders', async (req, res) => {
 app.patch('/api/orders/:id', async (req, res) => {
   const { data } = await sb.from('ml_orders').update({
     ...req.body,
-    separated_at: new Date().toISOString()
+    updated_at: new Date().toISOString()
   }).eq('id', req.params.id).select().single()
   res.json(data)
 })
@@ -230,6 +227,19 @@ app.patch('/api/orders/:id', async (req, res) => {
 app.post('/api/sync', async (req, res) => {
   await syncAll()
   res.json({ ok: true, message: 'Sincronização concluída!' })
+})
+
+app.get('/api/stats', async (req, res) => {
+  const { data } = await sb.from('ml_orders').select('status, order_type, is_fulfillment')
+  const stats = {
+    aguardando: data?.filter(o => o.status === 'aguardando').length || 0,
+    separando: data?.filter(o => o.status === 'separando').length || 0,
+    embalado: data?.filter(o => o.status === 'embalado').length || 0,
+    erro: data?.filter(o => o.status === 'erro').length || 0,
+    full_ml: data?.filter(o => o.status === 'full_ml').length || 0,
+    total: data?.length || 0
+  }
+  res.json(stats)
 })
 
 app.post('/api/ml/import-products', async (req, res) => {
@@ -261,24 +271,15 @@ app.post('/api/ml/import-products', async (req, res) => {
             source: 'mercadolivre'
           }, { onConflict: 'sku' })
           imported++
-        } catch(e) { console.error('Item error:', e.message) }
+        } catch(e) {}
       }
     } catch (e) { console.error('Import error:', e.message) }
   }
   res.json({ imported, message: `${imported} produtos importados!` })
 })
 
-// Add shipment_id column if not exists
-async function setupDB() {
-  try {
-    await sb.rpc('exec', { sql: 'ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS shipment_id text' })
-  } catch(e) {}
-}
-
 const PORT = process.env.PORT || 3001
-app.listen(PORT, async () => {
-  console.log(`🚀 TMP10 Backend v2.0 na porta ${PORT}`)
-  await setupDB()
-  // Sync on startup
+app.listen(PORT, () => {
+  console.log(`🚀 TMP10 Backend v3.0 na porta ${PORT}`)
   setTimeout(syncAll, 5000)
 })
