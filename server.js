@@ -146,6 +146,18 @@ async function syncMLOrders(account) {
         // FLEX/NORMAL: status = 'aguardando' (entra na fila de embalagem)
         const status = full ? 'full_ml' : 'aguardando'
 
+        // Get tracking number from shipment
+        let trackingNumber = null
+        try {
+          if (order.shipping?.id) {
+            const { data: shipment } = await axios.get(
+              `https://api.mercadolibre.com/shipments/${order.shipping.id}`,
+              { headers: { Authorization: `Bearer ${token}` } }
+            )
+            trackingNumber = shipment?.tracking_number || shipment?.tracking_method || String(order.shipping.id)
+          }
+        } catch(e) {}
+
         await sb.from('ml_orders').insert({
           ml_order_id: String(order.id),
           account_nickname: account.nickname,
@@ -156,6 +168,7 @@ async function syncMLOrders(account) {
           items,
           ml_status: mlStatus,
           shipment_id: order.shipping?.id ? String(order.shipping.id) : null,
+          tracking_number: trackingNumber,
           created_at_ml: order.date_created
         })
 
