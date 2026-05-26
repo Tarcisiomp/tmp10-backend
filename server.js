@@ -155,7 +155,6 @@ async function detectOrderType(order, token) {
 
   return 'NORMAL'
 }
-}
 
 // ── Sync ──────────────────────────────────────────────────────────
 async function syncMLOrders(account) {
