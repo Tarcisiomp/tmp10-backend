@@ -85,24 +85,45 @@ async function getToken(account) {
 }
 
 // ── Detectar tipo via /shipments/{id} ─────────────────────────────
-// Regra oficial:
-//   fulfillment  => FULL  (ML embala, nao entra na fila manual)
-//   self_service => FLEX  (entra na fila prioritaria)
-//   drop_off     => NORMAL
-//   *qualquer outro* => NORMAL
+// REGRA OFICIAL ML:
+//   FULL = logistic_type === 'fulfillment' E enviado pelo CD do ML
+//   FLEX = logistic_type === 'self_service'
+//   NORMAL = tudo o mais (drop_off, me1, me2, xd_drop_off, etc)
+//
+// IMPORTANTE: me2 = Mercado Envios 2 = envio NORMAL (não é FULL!)
+// FULL só é FULL quando logistic_type === 'fulfillment' explicitamente
+
+function isFulfillment(shipment) {
+  const logistic = (shipment?.logistic_type || '').toLowerCase()
+  const tags     = shipment?.tags || []
+
+  // Critério 1 — logistic_type explicitamente fulfillment
+  if (logistic === 'fulfillment') return true
+
+  // Critério 2 — tag meli_fulfillment (nome oficial da tag do FULL)
+  if (tags.includes('meli_fulfillment')) return true
+
+  // Critério 3 — modo me1 + fulfillment juntos (raramente usado)
+  // NÃO inclui me2 sozinho — me2 = Mercado Envios 2 = envio normal!
+
+  return false
+}
+
 async function detectOrderType(order, token) {
-  // Primeiro: verifica pelo payload do pedido (rapido, sem chamada extra)
-  const logisticFromOrder = (order.shipping?.logistic_type || '').toLowerCase()
   const tags = order.tags || []
+  const shippingLogistic = (order.shipping?.logistic_type || '').toLowerCase()
 
-  // Se o payload ja tem a info, usa direto
-  if (logisticFromOrder === 'fulfillment' || tags.includes('fulfillment') || tags.includes('meli_fulfillment')) {
-    return 'FULL'
-  }
-  if (logisticFromOrder === 'self_service') return 'FLEX'
-  if (logisticFromOrder === 'drop_off') return 'NORMAL'
+  // 1. Verifica pelo payload do pedido (rápido)
+  // Tag fulfillment no pedido = FULL com certeza
+  if (tags.includes('meli_fulfillment')) return 'FULL'
 
-  // Se nao tem logistic_type no payload, busca no /shipments/{id}
+  // logistic_type no payload do pedido
+  if (shippingLogistic === 'fulfillment') return 'FULL'
+  if (shippingLogistic === 'self_service') return 'FLEX'
+  if (shippingLogistic === 'drop_off') return 'NORMAL'
+  // NÃO retorna FULL para 'me2' — me2 é envio normal!
+
+  // 2. Consulta /shipments para confirmar (fonte mais confiável)
   const shipmentId = order.shipping?.id
   if (shipmentId && token) {
     try {
@@ -110,24 +131,30 @@ async function detectOrderType(order, token) {
         `https://api.mercadolibre.com/shipments/${shipmentId}`,
         { headers: { Authorization: `Bearer ${token}` }, timeout: 5000 }
       )
-      const logistic = (shipment.logistic_type || '').toLowerCase()
-      const modeType = (shipment.mode || '').toLowerCase()
 
-      if (logistic === 'fulfillment' || modeType === 'me2') return 'FULL'
+      const logistic  = (shipment.logistic_type || '').toLowerCase()
+      const mode      = (shipment.mode || '').toLowerCase()
+      const shipTags  = shipment.tags || []
+
+      console.log(`  Shipment ${shipmentId}: logistic=${logistic} mode=${mode} tags=${shipTags.join(',')}`)
+
+      // FULL — critério rigoroso
+      if (isFulfillment(shipment)) return 'FULL'
+
+      // FLEX
       if (logistic === 'self_service') return 'FLEX'
-      if (logistic === 'drop_off') return 'NORMAL'
 
-      // Tags do shipment
-      const shipTags = shipment.tags || []
-      if (shipTags.includes('fulfillment') || shipTags.includes('meli_fulfillment')) return 'FULL'
+      // NORMAL — tudo o mais (drop_off, me1, me2, xd_drop_off, etc)
+      // me2 = Mercado Envios 2 = NORMAL (empresa embala e envia)
+      return 'NORMAL'
 
     } catch (e) {
-      // Se falhar a consulta, deixa como NORMAL
       console.log(`  Shipment ${shipmentId} lookup failed: ${e.message}`)
     }
   }
 
   return 'NORMAL'
+}
 }
 
 // ── Sync ──────────────────────────────────────────────────────────
@@ -241,13 +268,13 @@ async function reclassifyOrders() {
   const { data: accounts } = await sb.from('ml_accounts').select('*').eq('active', true)
   if (!accounts?.length) return
 
-  // Busca pedidos NORMAL com shipment_id (candidatos a revisao)
+  // Busca pedidos com shipment_id para verificar classificação
+  // Inclui NORMAL (podem ser FULL errados) e FULL (podem ser NORMAL errados)
   const { data: orders } = await sb.from('ml_orders')
     .select('id, ml_order_id, shipment_id, order_type, status')
-    .eq('order_type', 'NORMAL')
-    .eq('status', 'aguardando')
+    .in('status', ['aguardando', 'separando', 'conferindo', 'full_ml'])
     .not('shipment_id', 'is', null)
-    .limit(50) // processa 50 por vez
+    .limit(100)
 
   if (!orders?.length) return
 
@@ -261,26 +288,28 @@ async function reclassifyOrders() {
         `https://api.mercadolibre.com/shipments/${order.shipment_id}`,
         { headers: { Authorization: `Bearer ${token}` }, timeout: 5000 }
       )
-      const logistic = (shipment.logistic_type || '').toLowerCase()
-      const shipTags = shipment.tags || []
 
-      let newType = null
-      if (logistic === 'fulfillment' || shipTags.includes('fulfillment') || shipTags.includes('meli_fulfillment')) {
-        newType = 'FULL'
+      const logistic  = (shipment.logistic_type || '').toLowerCase()
+      const shipTags  = shipment.tags || []
+
+      // Usa a mesma regra rigorosa — me2 NÃO é FULL
+      let correctType = 'NORMAL'
+      if (isFulfillment(shipment)) {
+        correctType = 'FULL'
       } else if (logistic === 'self_service') {
-        newType = 'FLEX'
+        correctType = 'FLEX'
       }
 
-      if (newType && newType !== order.order_type) {
-        const newStatus = newType === 'FULL' ? 'full_ml' : 'aguardando'
+      if (correctType !== order.order_type) {
+        const newStatus = correctType === 'FULL' ? 'full_ml' : 'aguardando'
         await sb.from('ml_orders').update({
-          order_type: newType,
-          is_fulfillment: newType === 'FULL',
+          order_type: correctType,
+          is_fulfillment: correctType === 'FULL',
           status: newStatus,
           updated_at: new Date().toISOString()
         }).eq('id', order.id)
         fixed++
-        console.log(`🔄 Reclassificado ${order.ml_order_id}: NORMAL -> ${newType}`)
+        console.log(`🔄 Reclassificado ${order.ml_order_id}: ${order.order_type} -> ${correctType} (logistic=${logistic})`)
       }
     } catch (e) {
       // ignora erros individuais
@@ -288,17 +317,176 @@ async function reclassifyOrders() {
   }
 
   if (fixed > 0) console.log(`✅ Reclassificados ${fixed} pedidos`)
+  else console.log('✅ Todos os pedidos já estão classificados corretamente')
 }
 
-// Reclassifica 1x por hora
-cron.schedule('0 * * * *', reclassifyOrders)
+// ── Verificar entregas — dá baixa automática ──────
+// Consulta o status do shipment no ML e finaliza pedidos entregues
+async function checkDeliveries() {
+  const { data: accounts } = await sb.from('ml_accounts').select('*').eq('active', true)
+  if (!accounts?.length) return
 
-// ── Routes ────────────────────────────────────────────────────────
+  // Busca pedidos embalados ou aguardando/separando que têm shipment_id
+  // (pedidos que já saíram mas podem ter sido entregues direto pelo ML)
+  const { data: orders } = await sb.from('ml_orders')
+    .select('id, ml_order_id, shipment_id, status, order_type')
+    .in('status', ['embalado', 'aguardando', 'separando', 'conferindo', 'full_ml'])
+    .not('shipment_id', 'is', null)
+    .limit(100)
+
+  if (!orders?.length) return
+
+  const account = accounts[0]
+  const token = await getToken(account)
+  let delivered = 0
+  let cancelled = 0
+
+  for (const order of orders) {
+    try {
+      // Consulta status do shipment no ML
+      const { data: shipment } = await axios.get(
+        `https://api.mercadolibre.com/shipments/${order.shipment_id}`,
+        { headers: { Authorization: `Bearer ${token}` }, timeout: 5000 }
+      )
+
+      const shipStatus = (shipment.status || '').toLowerCase()
+      const substatus  = (shipment.substatus || '').toLowerCase()
+
+      // Status de entregue no ML
+      const entregue = [
+        'delivered',      // entregue
+        'delivered_to_neighbor', // entregue ao vizinho
+      ].includes(shipStatus)
+
+      // Cancelado/devolvido no ML
+      const cancelado = [
+        'cancelled',
+        'not_delivered',
+        'returned',
+        'lost'
+      ].includes(shipStatus)
+
+      if (entregue && order.status !== 'finalizado') {
+        await sb.from('ml_orders').update({
+          status: 'finalizado',
+          tracking_number: shipment.tracking_number || order.tracking_number || null,
+          updated_at: new Date().toISOString()
+        }).eq('id', order.id)
+        delivered++
+        console.log(`📦 Entregue: ${order.ml_order_id} (${shipStatus})`)
+      }
+
+      // Também atualiza tracking_number se não tiver
+      if (!order.tracking_number && shipment.tracking_number) {
+        await sb.from('ml_orders').update({
+          tracking_number: shipment.tracking_number,
+          updated_at: new Date().toISOString()
+        }).eq('id', order.id)
+      }
+
+    } catch (e) {
+      // ignora erros individuais (token expirado, shipment não encontrado)
+    }
+  }
+
+  if (delivered > 0) console.log(`✅ ${delivered} pedidos finalizados automaticamente`)
+  if (cancelled > 0) console.log(`❌ ${cancelled} pedidos cancelados pelo ML`)
+}
+
+// Verifica entregas a cada 15 minutos
+cron.schedule('*/15 * * * *', checkDeliveries)
+
+// ── Webhook do ML — recebe notificações em tempo real ─
+// Quando o ML entrega um pedido, ele notifica esta rota
+app.post('/ml/notifications', async (req, res) => {
+  // Responde 200 imediatamente (ML exige resposta rápida)
+  res.status(200).json({ ok: true })
+
+  try {
+    const { resource, topic, user_id } = req.body
+    console.log(`📩 Notificação ML: topic=${topic}, resource=${resource}`)
+
+    // Só processa notificações de shipments (entregas)
+    if (topic !== 'shipments' && topic !== 'orders_v2') return
+
+    const { data: accounts } = await sb.from('ml_accounts').select('*').eq('active', true)
+    if (!accounts?.length) return
+
+    const account = accounts.find(a => String(a.ml_user_id) === String(user_id)) || accounts[0]
+    const token = await getToken(account)
+
+    if (topic === 'shipments' && resource) {
+      // Extrai o shipment_id da URL do resource
+      const shipmentId = resource.split('/').pop()
+      if (!shipmentId) return
+
+      const { data: shipment } = await axios.get(
+        `https://api.mercadolibre.com/shipments/${shipmentId}`,
+        { headers: { Authorization: `Bearer ${token}` }, timeout: 5000 }
+      )
+
+      const shipStatus = (shipment.status || '').toLowerCase()
+
+      if (shipStatus === 'delivered') {
+        // Busca o pedido pelo shipment_id
+        const { data: order } = await sb.from('ml_orders')
+          .select('id, ml_order_id, status')
+          .eq('shipment_id', String(shipmentId))
+          .maybeSingle()
+
+        if (order && order.status !== 'finalizado') {
+          await sb.from('ml_orders').update({
+            status: 'finalizado',
+            tracking_number: shipment.tracking_number || null,
+            updated_at: new Date().toISOString()
+          }).eq('id', order.id)
+          console.log(`🎉 Webhook: pedido ${order.ml_order_id} finalizado (entregue)`)
+        }
+      }
+    }
+
+    if (topic === 'orders_v2' && resource) {
+      // Verifica se o pedido foi cancelado no ML
+      const orderId = resource.split('/').pop()
+      const { data: mlOrder } = await axios.get(
+        `https://api.mercadolibre.com/orders/${orderId}`,
+        { headers: { Authorization: `Bearer ${token}` }, timeout: 5000 }
+      )
+
+      if (mlOrder.status === 'cancelled') {
+        const { data: order } = await sb.from('ml_orders')
+          .select('id, status')
+          .eq('ml_order_id', String(orderId))
+          .maybeSingle()
+
+        if (order && !['finalizado','cancelado'].includes(order.status)) {
+          await sb.from('ml_orders').update({
+            status: 'cancelado',
+            updated_at: new Date().toISOString()
+          }).eq('id', order.id)
+          console.log(`🚫 Webhook: pedido ${orderId} cancelado no ML`)
+        }
+      }
+    }
+  } catch (e) {
+    console.error('Webhook error:', e.message)
+  }
+})
+
+// Rota para forçar verificação de entregas manualmente
+app.post('/api/check-deliveries', async (req, res) => {
+  await checkDeliveries()
+  res.json({ ok: true, message: 'Verificação de entregas executada!' })
+})
+
+
 app.get('/', (req, res) => res.json({
-  status: '🚀 TMP10 Backend v6.0',
+  status: '🚀 TMP10 Backend v7.0',
   uptime: Math.floor(process.uptime()) + 's',
   sync_interval: '2 minutos',
-  reclassify_interval: '1 hora'
+  reclassify_interval: '1 hora',
+  delivery_check_interval: '15 minutos',
+  webhook: '/ml/notifications'
 }))
 
 app.get('/api/ml/accounts', async (req, res) => {
@@ -346,6 +534,58 @@ app.post('/api/reclassify', async (req, res) => {
   res.json({ ok: true, message: 'Reclassificacao executada!' })
 })
 
+// Rota para reclassificar TODOS os pedidos (sem limite)
+app.post('/api/reclassify-all', async (req, res) => {
+  res.json({ ok: true, message: 'Reclassificação em massa iniciada em background...' })
+
+  // Roda em background sem bloquear a resposta
+  ;(async () => {
+    const { data: accounts } = await sb.from('ml_accounts').select('*').eq('active', true)
+    if (!accounts?.length) return
+
+    const { data: orders } = await sb.from('ml_orders')
+      .select('id, ml_order_id, shipment_id, order_type, status')
+      .in('status', ['aguardando', 'separando', 'conferindo', 'full_ml', 'embalado'])
+      .not('shipment_id', 'is', null)
+
+    if (!orders?.length) { console.log('Nenhum pedido para reclassificar'); return }
+
+    console.log(`🔄 Reclassificando ${orders.length} pedidos...`)
+    const account = accounts[0]
+    const token = await getToken(account)
+    let fixed = 0
+
+    for (const order of orders) {
+      try {
+        const { data: shipment } = await axios.get(
+          `https://api.mercadolibre.com/shipments/${order.shipment_id}`,
+          { headers: { Authorization: `Bearer ${token}` }, timeout: 5000 }
+        )
+        const logistic = (shipment.logistic_type || '').toLowerCase()
+
+        let correctType = 'NORMAL'
+        if (isFulfillment(shipment)) correctType = 'FULL'
+        else if (logistic === 'self_service') correctType = 'FLEX'
+
+        if (correctType !== order.order_type) {
+          const newStatus = correctType === 'FULL' ? 'full_ml' : 'aguardando'
+          await sb.from('ml_orders').update({
+            order_type: correctType,
+            is_fulfillment: correctType === 'FULL',
+            status: newStatus,
+            updated_at: new Date().toISOString()
+          }).eq('id', order.id)
+          fixed++
+          console.log(`🔄 ${order.ml_order_id}: ${order.order_type} → ${correctType}`)
+        }
+        // Pausa pequena para não sobrecarregar a API do ML
+        await new Promise(r => setTimeout(r, 200))
+      } catch (e) {}
+    }
+    console.log(`✅ Reclassificação em massa: ${fixed} pedidos corrigidos de ${orders.length}`)
+  })()
+})
+
 // Rota para corrigir um pedido especifico pelo ml_order_id
 app.post('/api/fix-order/:mlOrderId', async (req, res) => {
   const { mlOrderId } = req.params
@@ -369,10 +609,10 @@ app.post('/api/fix-order/:mlOrderId', async (req, res) => {
     )
 
     const logistic = (shipment.logistic_type || '').toLowerCase()
-    const shipTags = shipment.tags || []
 
+    // Usa regra rigorosa — me2 NÃO é FULL
     let newType = 'NORMAL'
-    if (logistic === 'fulfillment' || shipTags.includes('fulfillment')) newType = 'FULL'
+    if (isFulfillment(shipment)) newType = 'FULL'
     else if (logistic === 'self_service') newType = 'FLEX'
 
     await sb.from('ml_orders').update({
@@ -449,7 +689,8 @@ app.post('/api/ml/import-products', async (req, res) => {
 
 const PORT = process.env.PORT || 3001
 app.listen(PORT, () => {
-  console.log(`🚀 TMP10 v6.0 porta ${PORT}`)
+  console.log(`🚀 TMP10 v7.0 porta ${PORT}`)
   setTimeout(syncAll, 3000)
-  setTimeout(reclassifyOrders, 10000) // reclassifica 10s apos iniciar
+  setTimeout(reclassifyOrders, 10000)
+  setTimeout(checkDeliveries, 20000) // verifica entregas 20s após iniciar
 })
