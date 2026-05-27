@@ -210,7 +210,8 @@ async function syncMLOrders(account) {
               ml_status: mlStatus,
               shipment_id: order.shipping?.id ? String(order.shipping.id) : null,
               tracking_number: null,
-              created_at_ml: order.date_created
+              created_at_ml: order.date_created,
+              total_amount: order.total_amount || null
             })
 
             // Auto cadastra produto (apenas nao-FULL)
