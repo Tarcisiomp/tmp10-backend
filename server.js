@@ -200,9 +200,26 @@ async function syncMLOrders(account) {
             }))
 
             // Calcula custos da plataforma ML
+            // sale_fee = soma de todos os itens (comissão total)
             const saleFeeTot = order.order_items?.reduce((s,i)=>s+(i.sale_fee||0),0)||0
-            const shippingCost = order.shipping_cost || 0
             const taxesAmount = order.taxes?.amount || 0
+
+            // Frete real vem do /shipments — não do payload do pedido
+            let shippingCost = 0
+            const shipId = order.shipping?.id
+            if(shipId && token){
+              try{
+                const {data:shipData}=await axios.get(
+                  `https://api.mercadolibre.com/shipments/${shipId}`,
+                  {headers:{Authorization:`Bearer ${token}`},timeout:5000}
+                )
+                // Custo do frete para o vendedor
+                shippingCost = shipData.cost?.sender?.cost || shipData.base_cost || 0
+              }catch(e){
+                // Se falhar, tenta pelo campo do pedido
+                shippingCost = order.shipping_cost || 0
+              }
+            }
             const paidAmount = order.paid_amount || order.total_amount || 0
 
             await sb.from('ml_orders').insert({
@@ -481,6 +498,68 @@ app.post('/ml/notifications', async (req, res) => {
   } catch (e) {
     console.error('Webhook error:', e.message)
   }
+})
+
+// Recalcula custos (sale_fee, frete) de pedidos existentes
+app.post('/api/recalcular-custos', async (req, res) => {
+  res.json({ ok: true, message: 'Recalculando custos em background...' })
+  ;(async () => {
+    const { data: accounts } = await sb.from('ml_accounts').select('*').eq('active', true)
+    if (!accounts?.length) return
+    const token = await getToken(accounts[0])
+
+    // Busca pedidos com sale_fee incorreto ou frete zerado
+    const { data: orders } = await sb.from('ml_orders')
+      .select('id, ml_order_id, shipment_id, sale_fee, shipping_cost_ml, total_amount')
+      .not('shipment_id', 'is', null)
+      .limit(200)
+
+    if (!orders?.length) return
+    let fixed = 0
+
+    for (const order of orders) {
+      try {
+        // Busca o pedido completo na API do ML
+        const { data: mlOrder } = await axios.get(
+          `https://api.mercadolibre.com/orders/${order.ml_order_id}`,
+          { headers: { Authorization: `Bearer ${token}` }, timeout: 5000 }
+        )
+
+        const saleFeeTot = mlOrder.order_items?.reduce((s,i)=>s+(i.sale_fee||0),0)||0
+        const taxesAmount = mlOrder.taxes?.amount || 0
+
+        // Busca frete no shipment
+        let shippingCost = 0
+        if (order.shipment_id) {
+          try {
+            const { data: shipData } = await axios.get(
+              `https://api.mercadolibre.com/shipments/${order.shipment_id}`,
+              { headers: { Authorization: `Bearer ${token}` }, timeout: 5000 }
+            )
+            shippingCost = shipData.cost?.sender?.cost || shipData.base_cost || 0
+          } catch(e) {}
+        }
+
+        // Atualiza se mudou
+        if (saleFeeTot !== order.sale_fee || shippingCost !== order.shipping_cost_ml) {
+          await sb.from('ml_orders').update({
+            sale_fee: saleFeeTot,
+            shipping_cost_ml: shippingCost,
+            taxes_amount: taxesAmount,
+            total_amount: mlOrder.total_amount || order.total_amount,
+            updated_at: new Date().toISOString()
+          }).eq('id', order.id)
+          fixed++
+          console.log(`💰 Custos atualizados: ${order.ml_order_id} — comissão=${saleFeeTot} frete=${shippingCost}`)
+        }
+
+        await new Promise(r => setTimeout(r, 300)) // pausa para não sobrecarregar API
+      } catch(e) {
+        console.log(`Erro em ${order.ml_order_id}: ${e.message}`)
+      }
+    }
+    console.log(`✅ Custos recalculados: ${fixed} pedidos atualizados`)
+  })()
 })
 
 // Rota para forçar verificação de entregas manualmente
