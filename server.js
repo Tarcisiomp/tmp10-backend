@@ -199,6 +199,12 @@ async function syncMLOrders(account) {
               thumbnail: item.item.thumbnail
             }))
 
+            // Calcula custos da plataforma ML
+            const saleFeeTot = order.order_items?.reduce((s,i)=>s+(i.sale_fee||0),0)||0
+            const shippingCost = order.shipping_cost || 0
+            const taxesAmount = order.taxes?.amount || 0
+            const paidAmount = order.paid_amount || order.total_amount || 0
+
             await sb.from('ml_orders').insert({
               ml_order_id: String(order.id),
               account_nickname: account.nickname,
@@ -212,7 +218,10 @@ async function syncMLOrders(account) {
               tracking_number: null,
               created_at_ml: order.date_created,
               total_amount: order.total_amount || null,
-              sale_fee: order.order_items?.reduce((s,i)=>s+(i.sale_fee||0),0)||null
+              paid_amount: paidAmount,
+              sale_fee: saleFeeTot,
+              shipping_cost_ml: shippingCost,
+              taxes_amount: taxesAmount
             })
 
             // Auto cadastra produto (apenas nao-FULL)
