@@ -423,6 +423,7 @@ async function checkDeliveries() {
 }
 
 // Verifica entregas a cada 15 minutos
+cron.schedule('*/30 * * * *', syncEstoqueML)
 cron.schedule('*/15 * * * *', checkDeliveries)
 
 // ── Webhook do ML — recebe notificações em tempo real ─
@@ -562,6 +563,42 @@ app.post('/api/recalcular-custos', async (req, res) => {
     }
     console.log(`✅ Custos recalculados: ${fixed} pedidos atualizados`)
   })()
+})
+
+// ── Sync Estoque ML ──────────────────────────────────────────────────────────
+async function syncEstoqueML(){
+  try{
+    const {data:prods}=await sb.from('products').select('id,ml_item_id,sku').not('ml_item_id','is',null)
+    if(!prods?.length) return
+    const {data:accounts}=await sb.from('ml_accounts').select('*').eq('active',true)
+    if(!accounts?.length) return
+    const token=await getToken(accounts[0])
+    if(!token) return
+
+    for(const prod of prods){
+      try{
+        const {data:item}=await axios.get(
+          `https://api.mercadolibre.com/items/${prod.ml_item_id}`,
+          {headers:{Authorization:`Bearer ${token}`},timeout:5000}
+        )
+        const estoque=item.available_quantity||0
+        await sb.from('products').update({estoque_atual:estoque,updated_at:new Date().toISOString()}).eq('id',prod.id)
+        console.log(`📦 Estoque ML: ${prod.sku} = ${estoque} un`)
+        await new Promise(r=>setTimeout(r,200))
+      }catch(e){
+        console.log(`Erro estoque ${prod.sku}: ${e.message}`)
+      }
+    }
+    console.log('✅ Sync estoque ML concluído')
+  }catch(e){
+    console.log('Erro sync estoque:', e.message)
+  }
+}
+
+// Endpoint manual para sync de estoque
+app.post('/api/sync-estoque', async(req,res)=>{
+  res.json({ok:true,message:'Sincronizando estoque ML...'})
+  syncEstoqueML()
 })
 
 // Rota para forçar verificação de entregas manualmente
