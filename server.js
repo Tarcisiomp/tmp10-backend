@@ -214,7 +214,9 @@ async function syncMLOrders(account) {
                   {headers:{Authorization:`Bearer ${token}`},timeout:5000}
                 )
                 // Custo do frete para o vendedor
-                shippingCost = shipData.base_cost || shipData.cost?.sender?.cost || 0
+                // cost_components.ratio = valor real cobrado do vendedor (já com descontos de reputação)
+              // base_cost = custo bruto sem descontos
+              shippingCost = shipData.cost_components?.ratio || shipData.base_cost || 0
               }catch(e){
                 // Se falhar, tenta pelo campo do pedido
                 shippingCost = order.shipping_cost || 0
@@ -536,7 +538,7 @@ app.post('/api/recalcular-custos', async (req, res) => {
               `https://api.mercadolibre.com/shipments/${order.shipment_id}`,
               { headers: { Authorization: `Bearer ${token}` }, timeout: 5000 }
             )
-            shippingCost = shipData.base_cost || shipData.cost?.sender?.cost || 0
+            shippingCost = shipData.cost_components?.ratio || shipData.base_cost || 0
           } catch(e) {}
         }
 
