@@ -5,6 +5,7 @@ const axios = require('axios')
 const cron = require('node-cron')
 const { createClient } = require('@supabase/supabase-js')
 
+
 const app = express()
 app.use(cors())
 app.use(express.json())
