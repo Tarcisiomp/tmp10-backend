@@ -11,7 +11,7 @@ app.use(express.json())
 
 const sb = createClient(
   process.env.SUPABASE_URL || 'https://foshqdjgbcigggrcjtap.supabase.co',
-  process.env.SUPABASE_SERVICE_KEY || 'sb_secret_AsA000_3nmzAuTQmn_Noaw_gleAikud'
+  process.env.SUPABASE_SERVICE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZvc2hxZGpnYmNpZ2dncmNqdGFwIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3OTQwMDAyMSwiZXhwIjoyMDk0OTc2MDIxfQ.6h_Pouyxs73jug7JJtCtfj50JJPi1whWnAkdJuPNSoI'
 )
 
 const ML_CLIENT_ID     = process.env.ML_CLIENT_ID     || '4022957335913783'
