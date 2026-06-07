@@ -5,7 +5,6 @@ const axios = require('axios')
 const cron = require('node-cron')
 const { createClient } = require('@supabase/supabase-js')
 
-
 const app = express()
 app.use(cors())
 app.use(express.json())
@@ -215,9 +214,10 @@ async function syncMLOrders(account) {
                   {headers:{Authorization:`Bearer ${token}`},timeout:5000}
                 )
                 // Custo do frete para o vendedor
-                // cost_components.ratio = valor real cobrado do vendedor (já com descontos de reputação)
+                // shipping_option.list_cost = valor real cobrado do vendedor
+              // cost_components.ratio = valor após descontos de reputação  
               // base_cost = custo bruto sem descontos
-              shippingCost = shipData.cost_components?.ratio || shipData.base_cost || 0
+              shippingCost = shipData.shipping_option?.list_cost || shipData.cost_components?.ratio || shipData.base_cost || 0
               }catch(e){
                 // Se falhar, tenta pelo campo do pedido
                 shippingCost = order.shipping_cost || 0
@@ -540,7 +540,7 @@ app.post('/api/recalcular-custos', async (req, res) => {
               `https://api.mercadolibre.com/shipments/${order.shipment_id}`,
               { headers: { Authorization: `Bearer ${token}` }, timeout: 5000 }
             )
-            shippingCost = shipData.cost_components?.ratio || shipData.base_cost || 0
+            shippingCost = shipData.shipping_option?.list_cost || shipData.cost_components?.ratio || shipData.base_cost || 0
           } catch(e) {}
         }
 
