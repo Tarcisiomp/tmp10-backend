@@ -426,6 +426,68 @@ async function checkDeliveries() {
 // Verifica entregas a cada 15 minutos
 cron.schedule('*/30 * * * *', syncEstoqueML)
 cron.schedule('*/15 * * * *', checkDeliveries)
+cron.schedule('*/5 * * * *', syncPerguntas) // Sync perguntas a cada 5 min
+
+// ── Sync Perguntas ML ─────────────────────────────────────────────────────────
+async function syncPerguntas(){
+  try{
+    const {data:accounts}=await sb.from('ml_accounts').select('*').eq('active',true)
+    if(!accounts?.length) return
+    let total=0
+    for(const account of accounts){
+      const token=await getToken(account)
+      if(!token) continue
+      try{
+        const {data:resp}=await axios.get(
+          `https://api.mercadolibre.com/my/questions/search?status=UNANSWERED&limit=20`,
+          {headers:{Authorization:`Bearer ${token}`},timeout:8000}
+        )
+        const perguntas=resp?.questions||[]
+        for(const p of perguntas){
+          const {data:item}=await axios.get(
+            `https://api.mercadolibre.com/items/${p.item_id}?attributes=title`,
+            {headers:{Authorization:`Bearer ${token}`},timeout:5000}
+          ).catch(()=>({data:null}))
+
+          const {error}=await sb.from('ml_perguntas').upsert({
+            pergunta_id:String(p.id),
+            account_nickname:account.nickname,
+            comprador:p.from?.nickname||'Cliente',
+            texto:p.text,
+            item_id:p.item_id,
+            item_titulo:item?.title||p.item_id,
+            status:'pendente',
+            created_at:p.date_created,
+            synced_at:new Date().toISOString()
+          },{onConflict:'pergunta_id',ignoreDuplicates:false})
+          if(!error) total++
+        }
+      }catch(e){
+        console.log(`Erro perguntas ${account.nickname}: ${e.message}`)
+      }
+    }
+    if(total>0) console.log(`💬 ${total} perguntas sincronizadas`)
+  }catch(e){
+    console.log('Erro sync perguntas:',e.message)
+  }
+}
+
+// Endpoint manual sync perguntas
+app.post('/api/sync-perguntas', async(req,res)=>{
+  res.json({ok:true,message:'Sincronizando perguntas...'})
+  syncPerguntas()
+})
+
+// Marca pergunta como respondida
+app.post('/api/pergunta-respondida/:id', async(req,res)=>{
+  await sb.from('ml_perguntas').update({
+    status:'respondido',
+    respondido_at:new Date().toISOString()
+  }).eq('pergunta_id',req.params.id)
+  res.json({ok:true})
+})
+
+
 
 // ── Webhook do ML — recebe notificações em tempo real ─
 // Quando o ML entrega um pedido, ele notifica esta rota
