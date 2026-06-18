@@ -567,29 +567,44 @@ app.post('/api/recalcular-frete', async (req, res) => {
 })
 
 app.post('/api/recalcular-custos', async (req, res) => {
-  res.json({ ok: true, message: 'Recalculando custos em background...' })
+  const offset = parseInt(req.query.offset || '0')
+  const limit = 50
+  res.json({ ok: true, message: `Recalculando custos (offset=${offset})...` })
   ;(async () => {
     const { data: accounts } = await sb.from('ml_accounts').select('*').eq('active', true)
     if (!accounts?.length) return
     const token = await getToken(accounts[0])
 
+    // Busca APENAS pedidos com frete provavelmente errado
+    // (paid_amount >= total_amount = backend antigo salvou errado)
     const { data: orders } = await sb.from('ml_orders')
-      .select('id, ml_order_id, shipment_id, sale_fee, shipping_cost_ml, total_amount')
+      .select('id, ml_order_id, shipment_id, sale_fee, shipping_cost_ml, total_amount, paid_amount')
       .not('shipment_id', 'is', null)
-      .limit(200)
+      .not('status', 'in', '(cancelado)')
+      .or('paid_amount.gte.total_amount,paid_amount.eq.0,paid_amount.is.null')
+      .order('created_at_ml', { ascending: false })
+      .range(offset, offset + limit - 1)
 
-    if (!orders?.length) return
+    if (!orders?.length) {
+      console.log('✅ Nenhum pedido para recalcular neste offset')
+      return
+    }
+
+    console.log(`🔄 Recalculando ${orders.length} pedidos (offset=${offset})`)
     let fixed = 0
 
     for (const order of orders) {
       try {
+        // Busca dados do shipment para calcular frete líquido
+        const { freteVendedor } = await calcShippingCost(order.shipment_id, token)
+        
+        // Busca sale_fee atualizado da API do ML
         const { data: mlOrder } = await axios.get(
           `https://api.mercadolibre.com/orders/${order.ml_order_id}`,
-          { headers: { Authorization: `Bearer ${token}` }, timeout: 5000 }
+          { headers: { Authorization: `Bearer ${token}` }, timeout: 8000 }
         )
-        const saleFeeTot = mlOrder.order_items?.reduce((s, i) => s + (i.sale_fee || 0), 0) || 0
+        const saleFeeTot = mlOrder.order_items?.reduce((s, i) => s + (i.sale_fee || 0), 0) || order.sale_fee || 0
         const taxesAmount = mlOrder.taxes?.amount || 0
-        const { freteVendedor } = await calcShippingCost(order.shipment_id, token)
         const totalAmount = mlOrder.total_amount || order.total_amount
         const paidAmount = totalAmount - saleFeeTot - freteVendedor
 
@@ -602,12 +617,13 @@ app.post('/api/recalcular-custos', async (req, res) => {
           updated_at: new Date().toISOString()
         }).eq('id', order.id)
         fixed++
-        await new Promise(r => setTimeout(r, 300))
+        console.log(`✅ ${order.ml_order_id}: frete=${freteVendedor} paid=${paidAmount}`)
+        await new Promise(r => setTimeout(r, 500))
       } catch (e) {
-        console.log(`Erro em ${order.ml_order_id}: ${e.message}`)
+        console.log(`❌ Erro em ${order.ml_order_id}: ${e.message}`)
       }
     }
-    console.log(`✅ Custos recalculados: ${fixed} pedidos`)
+    console.log(`✅ Recalculado: ${fixed}/${orders.length} pedidos (offset=${offset})`)
   })()
 })
 
