@@ -223,24 +223,29 @@ async function syncMLOrders(account) {
               thumbnail: item.item.thumbnail
             }))
 
-            // ✅ v9.2: paid_amount vem direto no objeto order da API do ML
+            // ✅ v9.3: Busca frete direto do /shipments/{id} via list_cost
             const saleFeeTot = order.order_items?.reduce((s,i) => s + (i.sale_fee || 0), 0) || 0
             const taxesAmount = order.taxes?.amount || 0
             const shipmentId = order.shipping?.id ? String(order.shipping.id) : null
 
-            const paidAmountML = order.paid_amount || order.payments?.[0]?.total_paid_amount || 0
-            let saleFeeLiquido, freteVendedor, paidAmount
-            if (paidAmountML > 0 && paidAmountML < totalAmount) {
-              const custoTotalLiquido = totalAmount - paidAmountML
-              saleFeeLiquido = saleFeeTot
-              freteVendedor = Math.max(0, custoTotalLiquido - saleFeeTot)
-              paidAmount = paidAmountML
-              console.log(`  Novo pedido ${order.id}: total=${totalAmount} paid=${paidAmountML} fee=${saleFeeLiquido} frete=${freteVendedor}`)
-            } else {
-              saleFeeLiquido = saleFeeTot
-              freteVendedor = 0
-              paidAmount = totalAmount - saleFeeLiquido
+            // Busca frete real do shipment
+            let freteVendedor = 0
+            if (shipmentId && token) {
+              try {
+                const { data: shipData } = await axios.get(
+                  `https://api.mercadolibre.com/shipments/${shipmentId}`,
+                  { headers: { Authorization: `Bearer ${token}` }, timeout: 5000 }
+                )
+                // list_cost = custo total do frete cobrado do vendedor
+                freteVendedor = shipData.shipping_option?.list_cost || shipData.cost?.sender?.cost || 0
+                console.log(`  Frete shipment ${shipmentId}: ${freteVendedor}`)
+              } catch(e) {
+                console.log(`  Erro frete ${shipmentId}: ${e.message}`)
+              }
             }
+
+            const saleFeeLiquido = saleFeeTot
+            const paidAmount = totalAmount - saleFeeLiquido - freteVendedor
 
             await sb.from('ml_orders').insert({
               ml_order_id: String(order.id),
@@ -598,27 +603,27 @@ app.post('/api/recalcular-custos', async (req, res) => {
         // ✅ Usa paid_amount real da API do ML (campo payments[0].total_paid_amount)
         // Esse valor é o que realmente cai na conta do vendedor
         // total_amount - paid_amount_real = tudo que o ML descontou (comissão + frete - bônus)
-        const paidAmountReal = mlOrder.paid_amount || mlOrder.payments?.[0]?.total_paid_amount || 0
         const saleFeeTot = mlOrder.order_items?.reduce((s,i) => s + (i.sale_fee || 0), 0) || order.sale_fee || 0
         const taxesAmountNew = mlOrder.taxes?.amount || 0
 
-        let saleFeeLiquido, freteVendedor, bonusCampanha, paidAmount
-
-        if (paidAmountReal > 0) {
-          // Temos o paid_amount real da API — é a fonte mais confiável
-          const custoTotalLiquido = totalAmount - paidAmountReal
-          saleFeeLiquido = saleFeeTot
-          freteVendedor = Math.max(0, custoTotalLiquido - saleFeeTot)
-          bonusCampanha = 0
-          paidAmount = paidAmountReal
-          console.log(`  paid_amount real: ${paidAmountReal} custo_total=${custoTotalLiquido} fee=${saleFeeLiquido} frete=${freteVendedor}`)
-        } else {
-          // Sem paid_amount — usa sale_fee e zera frete (melhor que nada)
-          saleFeeLiquido = saleFeeTot
-          freteVendedor = 0
-          bonusCampanha = 0
-          paidAmount = totalAmount - saleFeeLiquido
+        // ✅ v9.3: Busca frete direto do /shipments/{id}
+        let freteVendedor = 0
+        const shipmentIdRecalc = order.shipment_id
+        if (shipmentIdRecalc) {
+          try {
+            const { data: shipData } = await axios.get(
+              `https://api.mercadolibre.com/shipments/${shipmentIdRecalc}`,
+              { headers: { Authorization: `Bearer ${token}` }, timeout: 5000 }
+            )
+            freteVendedor = shipData.shipping_option?.list_cost || shipData.cost?.sender?.cost || 0
+            console.log(`  Frete recalc ${shipmentIdRecalc}: ${freteVendedor}`)
+          } catch(e) {
+            console.log(`  Erro frete recalc ${shipmentIdRecalc}: ${e.message}`)
+          }
         }
+
+        const saleFeeLiquido = saleFeeTot
+        const paidAmount = totalAmount - saleFeeLiquido - freteVendedor
         const taxesAmount = mlOrder.taxes?.amount || 0
 
         await sb.from('ml_orders').update({
@@ -684,7 +689,7 @@ app.post('/api/reclassify-all', async (req, res) => {
 })
 
 app.get('/', (req, res) => res.json({
-  status: '🚀 TMP10 Backend v9.2 — paid_amount direto ML',
+  status: '🚀 TMP10 Backend v9.3 — frete via shipments',
   uptime: Math.floor(process.uptime()) + 's',
   sync_interval: '2 minutos',
   delivery_check: '15 minutos'
@@ -773,7 +778,7 @@ app.post('/api/ml/import-products', async (req, res) => {
 
 const PORT = process.env.PORT || 3001
 app.listen(PORT, () => {
-  console.log(`🚀 TMP10 v9.2 porta ${PORT}`)
+  console.log(`🚀 TMP10 v9.3 porta ${PORT}`)
   setTimeout(syncAll, 3000)
   setTimeout(reclassifyOrders, 10000)
   setTimeout(checkDeliveries, 20000)
