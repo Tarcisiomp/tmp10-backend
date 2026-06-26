@@ -223,18 +223,19 @@ async function syncMLOrders(account) {
               thumbnail: item.item.thumbnail
             }))
 
-            // ✅ v9.1: Usa paid_amount real da API (payments[0].total_paid_amount)
-            const paidAmountReal = order.payments?.[0]?.total_paid_amount || 0
+            // ✅ v9.2: paid_amount vem direto no objeto order da API do ML
             const saleFeeTot = order.order_items?.reduce((s,i) => s + (i.sale_fee || 0), 0) || 0
             const taxesAmount = order.taxes?.amount || 0
             const shipmentId = order.shipping?.id ? String(order.shipping.id) : null
 
+            const paidAmountML = order.paid_amount || order.payments?.[0]?.total_paid_amount || 0
             let saleFeeLiquido, freteVendedor, paidAmount
-            if (paidAmountReal > 0) {
-              const custoTotalLiquido = totalAmount - paidAmountReal
+            if (paidAmountML > 0 && paidAmountML < totalAmount) {
+              const custoTotalLiquido = totalAmount - paidAmountML
               saleFeeLiquido = saleFeeTot
               freteVendedor = Math.max(0, custoTotalLiquido - saleFeeTot)
-              paidAmount = paidAmountReal
+              paidAmount = paidAmountML
+              console.log(`  Novo pedido ${order.id}: total=${totalAmount} paid=${paidAmountML} fee=${saleFeeLiquido} frete=${freteVendedor}`)
             } else {
               saleFeeLiquido = saleFeeTot
               freteVendedor = 0
@@ -597,7 +598,7 @@ app.post('/api/recalcular-custos', async (req, res) => {
         // ✅ Usa paid_amount real da API do ML (campo payments[0].total_paid_amount)
         // Esse valor é o que realmente cai na conta do vendedor
         // total_amount - paid_amount_real = tudo que o ML descontou (comissão + frete - bônus)
-        const paidAmountReal = mlOrder.payments?.[0]?.total_paid_amount || 0
+        const paidAmountReal = mlOrder.paid_amount || mlOrder.payments?.[0]?.total_paid_amount || 0
         const saleFeeTot = mlOrder.order_items?.reduce((s,i) => s + (i.sale_fee || 0), 0) || order.sale_fee || 0
         const taxesAmountNew = mlOrder.taxes?.amount || 0
 
@@ -683,7 +684,7 @@ app.post('/api/reclassify-all', async (req, res) => {
 })
 
 app.get('/', (req, res) => res.json({
-  status: '🚀 TMP10 Backend v9.1 — paid_amount real ML',
+  status: '🚀 TMP10 Backend v9.2 — paid_amount direto ML',
   uptime: Math.floor(process.uptime()) + 's',
   sync_interval: '2 minutos',
   delivery_check: '15 minutos'
@@ -772,7 +773,7 @@ app.post('/api/ml/import-products', async (req, res) => {
 
 const PORT = process.env.PORT || 3001
 app.listen(PORT, () => {
-  console.log(`🚀 TMP10 v9.1 porta ${PORT}`)
+  console.log(`🚀 TMP10 v9.2 porta ${PORT}`)
   setTimeout(syncAll, 3000)
   setTimeout(reclassifyOrders, 10000)
   setTimeout(checkDeliveries, 20000)
