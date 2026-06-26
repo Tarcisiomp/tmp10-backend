@@ -575,10 +575,16 @@ app.post('/api/recalcular-custos', async (req, res) => {
   ;(async () => {
     const { data: accounts } = await sb.from('ml_accounts').select('*').eq('active', true)
     if (!accounts?.length) return
-    const token = await getToken(accounts[0])
+
+    // ✅ v9.4: Mapeia token por nickname de conta
+    const tokenMap = {}
+    for (const acc of accounts) {
+      tokenMap[acc.nickname] = await getToken(acc)
+    }
+    const tokenDefault = tokenMap[accounts[0].nickname]
 
     const { data: orders } = await sb.from('ml_orders')
-      .select('id, ml_order_id, shipment_id, sale_fee, shipping_cost_ml, total_amount, paid_amount')
+      .select('id, ml_order_id, shipment_id, sale_fee, shipping_cost_ml, total_amount, paid_amount, account_nickname')
       .not('status', 'in', '(cancelado)')
       .order('created_at_ml', { ascending: false })
       .range(offset, offset + limit - 1)
@@ -593,30 +599,29 @@ app.post('/api/recalcular-custos', async (req, res) => {
 
     for (const order of orders) {
       try {
+        // Usa token da conta correta para cada pedido
+        const orderToken = tokenMap[order.account_nickname] || tokenDefault
+
         // Busca dados atualizados do ML
         const { data: mlOrder } = await axios.get(
           `https://api.mercadolibre.com/orders/${order.ml_order_id}`,
-          { headers: { Authorization: `Bearer ${token}` }, timeout: 8000 }
+          { headers: { Authorization: `Bearer ${orderToken}` }, timeout: 8000 }
         )
         const totalAmount = mlOrder.total_amount || order.total_amount
-
-        // ✅ Usa paid_amount real da API do ML (campo payments[0].total_paid_amount)
-        // Esse valor é o que realmente cai na conta do vendedor
-        // total_amount - paid_amount_real = tudo que o ML descontou (comissão + frete - bônus)
         const saleFeeTot = mlOrder.order_items?.reduce((s,i) => s + (i.sale_fee || 0), 0) || order.sale_fee || 0
         const taxesAmountNew = mlOrder.taxes?.amount || 0
 
-        // ✅ v9.3: Busca frete direto do /shipments/{id}
+        // ✅ v9.4: Busca frete com token correto da conta
         let freteVendedor = 0
         const shipmentIdRecalc = order.shipment_id
         if (shipmentIdRecalc) {
           try {
             const { data: shipData } = await axios.get(
               `https://api.mercadolibre.com/shipments/${shipmentIdRecalc}`,
-              { headers: { Authorization: `Bearer ${token}` }, timeout: 5000 }
+              { headers: { Authorization: `Bearer ${orderToken}` }, timeout: 5000 }
             )
             freteVendedor = shipData.shipping_option?.list_cost || shipData.cost?.sender?.cost || 0
-            console.log(`  Frete recalc ${shipmentIdRecalc}: ${freteVendedor}`)
+            console.log(`  Frete recalc ${order.account_nickname} ${shipmentIdRecalc}: ${freteVendedor}`)
           } catch(e) {
             console.log(`  Erro frete recalc ${shipmentIdRecalc}: ${e.message}`)
           }
@@ -689,7 +694,7 @@ app.post('/api/reclassify-all', async (req, res) => {
 })
 
 app.get('/', (req, res) => res.json({
-  status: '🚀 TMP10 Backend v9.3 — frete via shipments',
+  status: '🚀 TMP10 Backend v9.4 — token por conta',
   uptime: Math.floor(process.uptime()) + 's',
   sync_interval: '2 minutos',
   delivery_check: '15 minutos'
@@ -778,7 +783,7 @@ app.post('/api/ml/import-products', async (req, res) => {
 
 const PORT = process.env.PORT || 3001
 app.listen(PORT, () => {
-  console.log(`🚀 TMP10 v9.3 porta ${PORT}`)
+  console.log(`🚀 TMP10 v9.4 porta ${PORT}`)
   setTimeout(syncAll, 3000)
   setTimeout(reclassifyOrders, 10000)
   setTimeout(checkDeliveries, 20000)
