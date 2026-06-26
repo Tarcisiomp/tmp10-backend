@@ -223,26 +223,23 @@ async function syncMLOrders(account) {
               thumbnail: item.item.thumbnail
             }))
 
-            const totalAmount = order.total_amount || 0
+            // ✅ v9.1: Usa paid_amount real da API (payments[0].total_paid_amount)
+            const paidAmountReal = order.payments?.[0]?.total_paid_amount || 0
+            const saleFeeTot = order.order_items?.reduce((s,i) => s + (i.sale_fee || 0), 0) || 0
             const taxesAmount = order.taxes?.amount || 0
             const shipmentId = order.shipping?.id ? String(order.shipping.id) : null
 
-            // ✅ v9.0: Tenta billing_info primeiro, fallback para paid_amount
-            let saleFeeLiquido, freteVendedor, bonusCampanha
-            const billing = await calcCustosReaisML(String(order.id), token)
-            if (billing) {
-              saleFeeLiquido = billing.saleFeeLiquido
-              freteVendedor = billing.freteVendedor
-              bonusCampanha = billing.bonusCampanha
+            let saleFeeLiquido, freteVendedor, paidAmount
+            if (paidAmountReal > 0) {
+              const custoTotalLiquido = totalAmount - paidAmountReal
+              saleFeeLiquido = saleFeeTot
+              freteVendedor = Math.max(0, custoTotalLiquido - saleFeeTot)
+              paidAmount = paidAmountReal
             } else {
-              const fallback = await calcCustosFallback(order, token)
-              saleFeeLiquido = fallback.saleFeeLiquido
-              freteVendedor = fallback.freteVendedor
-              bonusCampanha = fallback.bonusCampanha
+              saleFeeLiquido = saleFeeTot
+              freteVendedor = 0
+              paidAmount = totalAmount - saleFeeLiquido
             }
-
-            // paid_amount = o que realmente cai na conta
-            const paidAmount = totalAmount - saleFeeLiquido - freteVendedor + bonusCampanha
 
             await sb.from('ml_orders').insert({
               ml_order_id: String(order.id),
@@ -597,23 +594,30 @@ app.post('/api/recalcular-custos', async (req, res) => {
         )
         const totalAmount = mlOrder.total_amount || order.total_amount
 
-        // Tenta billing_info primeiro
-        let saleFeeLiquido, freteVendedor, bonusCampanha
-        const billing = await calcCustosReaisML(order.ml_order_id, token)
-        if (billing) {
-          saleFeeLiquido = billing.saleFeeLiquido
-          freteVendedor = billing.freteVendedor
-          bonusCampanha = billing.bonusCampanha
-        } else {
-          // Fallback: usa paid_amount da API do ML
-          const paidAmountML = mlOrder.payments?.[0]?.total_paid_amount || mlOrder.paid_amount || 0
-          const custoTotal = totalAmount - paidAmountML
-          saleFeeLiquido = mlOrder.order_items?.reduce((s,i) => s + (i.sale_fee || 0), 0) || order.sale_fee || 0
-          freteVendedor = Math.max(0, custoTotal - saleFeeLiquido)
-          bonusCampanha = 0
-        }
+        // ✅ Usa paid_amount real da API do ML (campo payments[0].total_paid_amount)
+        // Esse valor é o que realmente cai na conta do vendedor
+        // total_amount - paid_amount_real = tudo que o ML descontou (comissão + frete - bônus)
+        const paidAmountReal = mlOrder.payments?.[0]?.total_paid_amount || 0
+        const saleFeeTot = mlOrder.order_items?.reduce((s,i) => s + (i.sale_fee || 0), 0) || order.sale_fee || 0
+        const taxesAmountNew = mlOrder.taxes?.amount || 0
 
-        const paidAmount = totalAmount - saleFeeLiquido - freteVendedor + bonusCampanha
+        let saleFeeLiquido, freteVendedor, bonusCampanha, paidAmount
+
+        if (paidAmountReal > 0) {
+          // Temos o paid_amount real da API — é a fonte mais confiável
+          const custoTotalLiquido = totalAmount - paidAmountReal
+          saleFeeLiquido = saleFeeTot
+          freteVendedor = Math.max(0, custoTotalLiquido - saleFeeTot)
+          bonusCampanha = 0
+          paidAmount = paidAmountReal
+          console.log(`  paid_amount real: ${paidAmountReal} custo_total=${custoTotalLiquido} fee=${saleFeeLiquido} frete=${freteVendedor}`)
+        } else {
+          // Sem paid_amount — usa sale_fee e zera frete (melhor que nada)
+          saleFeeLiquido = saleFeeTot
+          freteVendedor = 0
+          bonusCampanha = 0
+          paidAmount = totalAmount - saleFeeLiquido
+        }
         const taxesAmount = mlOrder.taxes?.amount || 0
 
         await sb.from('ml_orders').update({
@@ -679,7 +683,7 @@ app.post('/api/reclassify-all', async (req, res) => {
 })
 
 app.get('/', (req, res) => res.json({
-  status: '🚀 TMP10 Backend v9.0 — billing_info corrigido',
+  status: '🚀 TMP10 Backend v9.1 — paid_amount real ML',
   uptime: Math.floor(process.uptime()) + 's',
   sync_interval: '2 minutos',
   delivery_check: '15 minutos'
@@ -768,7 +772,7 @@ app.post('/api/ml/import-products', async (req, res) => {
 
 const PORT = process.env.PORT || 3001
 app.listen(PORT, () => {
-  console.log(`🚀 TMP10 v9.0 porta ${PORT}`)
+  console.log(`🚀 TMP10 v9.1 porta ${PORT}`)
   setTimeout(syncAll, 3000)
   setTimeout(reclassifyOrders, 10000)
   setTimeout(checkDeliveries, 20000)
