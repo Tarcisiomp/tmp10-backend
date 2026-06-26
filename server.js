@@ -121,37 +121,65 @@ async function detectOrderType(order, token) {
   return 'NORMAL'
 }
 
-// ── Calcular frete líquido real ────────────────────────────────────
-// O vendedor paga apenas a diferença entre o custo total do frete
-// e o que o comprador pagou de frete
-// base_cost = o que o comprador paga de frete
-// list_cost = custo total do frete (vendedor + comprador)
-// freteVendedor = list_cost - base_cost
-async function calcShippingCost(shipmentId, token) {
-  if (!shipmentId || !token) return { freteVendedor: 0, freteComprador: 0, freteBruto: 0 }
+// ── CORREÇÃO v9.0: Buscar custos reais via /orders/{id}/billing_info ──────────
+// A API do ML tem um endpoint específico que retorna exatamente o que aparece
+// no extrato do vendedor: comissão real, frete real, descontos/bônus de campanha
+async function calcCustosReaisML(mlOrderId, token) {
+  if (!mlOrderId || !token) return { saleFeeLiquido: 0, freteVendedor: 0, bonusCampanha: 0 }
   try {
-    const { data: shipData } = await axios.get(
-      `https://api.mercadolibre.com/shipments/${shipmentId}`,
-      { headers: { Authorization: `Bearer ${token}` }, timeout: 5000 }
+    const { data } = await axios.get(
+      `https://api.mercadolibre.com/orders/${mlOrderId}/billing_info`,
+      { headers: { Authorization: `Bearer ${token}` }, timeout: 8000 }
     )
 
-    // Custo total cobrado do frete (vendedor + comprador)
-    const freteBruto = shipData.shipping_option?.list_cost ||
-                       shipData.cost_components?.ratio ||
-                       shipData.base_cost || 0
+    let saleFeeLiquido = 0
+    let freteVendedor = 0
+    let bonusCampanha = 0
 
-    // O que o comprador pagou de frete
-    const freteComprador = shipData.base_cost || 0
+    const items = data?.items || []
+    for (const item of items) {
+      const tipo = (item.type || '').toLowerCase()
+      const subtipo = (item.subtype || '').toLowerCase()
+      const valor = Math.abs(item.amount || 0)
 
-    // O que o VENDEDOR realmente paga = diferença
-    const freteVendedor = Math.max(0, freteBruto - freteComprador)
+      if (tipo === 'market_fee' || subtipo === 'sale_fee') {
+        saleFeeLiquido += valor
+      } else if (tipo === 'shipping' || subtipo === 'shipping') {
+        if ((item.amount || 0) < 0) {
+          freteVendedor += valor // custo para o vendedor (negativo = saída)
+        }
+      } else if (tipo === 'discount' || subtipo === 'campaign') {
+        bonusCampanha += valor // bônus/desconto que o ML devolve
+      }
+    }
 
-    console.log(`  Frete shipment ${shipmentId}: bruto=${freteBruto} comprador=${freteComprador} vendedor=${freteVendedor}`)
-    return { freteVendedor, freteComprador, freteBruto }
+    console.log(`  billing_info ${mlOrderId}: fee=${saleFeeLiquido} frete=${freteVendedor} bonus=${bonusCampanha}`)
+    return { saleFeeLiquido, freteVendedor, bonusCampanha }
   } catch (e) {
-    console.log(`  Erro frete shipment ${shipmentId}: ${e.message}`)
-    return { freteVendedor: 0, freteComprador: 0, freteBruto: 0 }
+    console.log(`  billing_info falhou ${mlOrderId}: ${e.message}`)
+    // Fallback: calcula pelo paid_amount
+    return null
   }
+}
+
+// ── Calcular custos via paid_amount (fallback) ─────────────────────
+// paid_amount da API do ML = total_amount - comissao - frete + bonus
+// Então: total_amount - paid_amount = custos_liquidos_totais
+async function calcCustosFallback(order, token) {
+  const totalAmount = order.total_amount || 0
+  const paidAmountML = order.payments?.[0]?.total_paid_amount || 
+                       order.paid_amount || 0
+
+  // Custo total líquido = o que o ML descontou
+  const custoTotal = totalAmount - paidAmountML
+
+  // sale_fee da API (soma de todos os itens)
+  const saleFeeTot = order.order_items?.reduce((s,i) => s + (i.sale_fee || 0), 0) || 0
+
+  // Frete = custo total - comissão (pode incluir bônus)
+  const freteVendedor = Math.max(0, custoTotal - saleFeeTot)
+
+  return { saleFeeLiquido: saleFeeTot, freteVendedor, bonusCampanha: 0 }
 }
 
 // ── Sync ──────────────────────────────────────────────────────────
@@ -195,17 +223,26 @@ async function syncMLOrders(account) {
               thumbnail: item.item.thumbnail
             }))
 
-            const saleFeeTot = order.order_items?.reduce((s,i) => s + (i.sale_fee || 0), 0) || 0
+            const totalAmount = order.total_amount || 0
             const taxesAmount = order.taxes?.amount || 0
             const shipmentId = order.shipping?.id ? String(order.shipping.id) : null
 
-            // ✅ CORREÇÃO: salvar frete líquido do vendedor
-            const { freteVendedor, freteComprador, freteBruto } = await calcShippingCost(shipmentId, token)
+            // ✅ v9.0: Tenta billing_info primeiro, fallback para paid_amount
+            let saleFeeLiquido, freteVendedor, bonusCampanha
+            const billing = await calcCustosReaisML(String(order.id), token)
+            if (billing) {
+              saleFeeLiquido = billing.saleFeeLiquido
+              freteVendedor = billing.freteVendedor
+              bonusCampanha = billing.bonusCampanha
+            } else {
+              const fallback = await calcCustosFallback(order, token)
+              saleFeeLiquido = fallback.saleFeeLiquido
+              freteVendedor = fallback.freteVendedor
+              bonusCampanha = fallback.bonusCampanha
+            }
 
-            // paid_amount = o que realmente cai na conta do vendedor
-            // total_amount - sale_fee - freteVendedor
-            const totalAmount = order.total_amount || 0
-            const paidAmount = totalAmount - saleFeeTot - freteVendedor
+            // paid_amount = o que realmente cai na conta
+            const paidAmount = totalAmount - saleFeeLiquido - freteVendedor + bonusCampanha
 
             await sb.from('ml_orders').insert({
               ml_order_id: String(order.id),
@@ -221,8 +258,8 @@ async function syncMLOrders(account) {
               created_at_ml: order.date_created,
               total_amount: totalAmount,
               paid_amount: paidAmount,
-              sale_fee: saleFeeTot,
-              shipping_cost_ml: freteVendedor, // ✅ frete líquido do vendedor
+              sale_fee: saleFeeLiquido,
+              shipping_cost_ml: freteVendedor,
               taxes_amount: taxesAmount
             })
 
@@ -527,61 +564,19 @@ app.post('/api/sync-estoque', async (req, res) => {
   syncEstoqueML()
 })
 
-// ✅ NOVO: Recalcular frete de pedidos existentes com o novo cálculo correto
-app.post('/api/recalcular-frete', async (req, res) => {
-  res.json({ ok: true, message: 'Recalculando frete em background...' })
-  ;(async () => {
-    const { data: accounts } = await sb.from('ml_accounts').select('*').eq('active', true)
-    if (!accounts?.length) return
-    const token = await getToken(accounts[0])
-
-    const { data: orders } = await sb.from('ml_orders')
-      .select('id, ml_order_id, shipment_id, total_amount, sale_fee, shipping_cost_ml, paid_amount')
-      .not('shipment_id', 'is', null)
-      .limit(500)
-
-    if (!orders?.length) return
-    let fixed = 0
-
-    for (const order of orders) {
-      try {
-        const { freteVendedor } = await calcShippingCost(order.shipment_id, token)
-        const paidAmount = (order.total_amount || 0) - (order.sale_fee || 0) - freteVendedor
-
-        if (Math.abs(freteVendedor - (order.shipping_cost_ml || 0)) > 0.01) {
-          await sb.from('ml_orders').update({
-            shipping_cost_ml: freteVendedor,
-            paid_amount: paidAmount,
-            updated_at: new Date().toISOString()
-          }).eq('id', order.id)
-          fixed++
-          console.log(`💰 Frete corrigido: ${order.ml_order_id} — antes=${order.shipping_cost_ml} depois=${freteVendedor}`)
-        }
-        await new Promise(r => setTimeout(r, 300))
-      } catch (e) {
-        console.log(`Erro em ${order.ml_order_id}: ${e.message}`)
-      }
-    }
-    console.log(`✅ Frete recalculado: ${fixed} pedidos corrigidos`)
-  })()
-})
-
+// ✅ v9.0: Recalcular custos usando billing_info (correto) + fallback paid_amount
 app.post('/api/recalcular-custos', async (req, res) => {
   const offset = parseInt(req.query.offset || '0')
-  const limit = 50
-  res.json({ ok: true, message: `Recalculando custos (offset=${offset})...` })
+  const limit = 30
+  res.json({ ok: true, message: `Recalculando custos v9 (offset=${offset})...` })
   ;(async () => {
     const { data: accounts } = await sb.from('ml_accounts').select('*').eq('active', true)
     if (!accounts?.length) return
     const token = await getToken(accounts[0])
 
-    // Busca APENAS pedidos com frete provavelmente errado
-    // (paid_amount >= total_amount = backend antigo salvou errado)
     const { data: orders } = await sb.from('ml_orders')
       .select('id, ml_order_id, shipment_id, sale_fee, shipping_cost_ml, total_amount, paid_amount')
-      .not('shipment_id', 'is', null)
       .not('status', 'in', '(cancelado)')
-      .or('paid_amount.gte.total_amount,paid_amount.eq.0,paid_amount.is.null')
       .order('created_at_ml', { ascending: false })
       .range(offset, offset + limit - 1)
 
@@ -595,21 +590,34 @@ app.post('/api/recalcular-custos', async (req, res) => {
 
     for (const order of orders) {
       try {
-        // Busca dados do shipment para calcular frete líquido
-        const { freteVendedor } = await calcShippingCost(order.shipment_id, token)
-        
-        // Busca sale_fee atualizado da API do ML
+        // Busca dados atualizados do ML
         const { data: mlOrder } = await axios.get(
           `https://api.mercadolibre.com/orders/${order.ml_order_id}`,
           { headers: { Authorization: `Bearer ${token}` }, timeout: 8000 }
         )
-        const saleFeeTot = mlOrder.order_items?.reduce((s, i) => s + (i.sale_fee || 0), 0) || order.sale_fee || 0
-        const taxesAmount = mlOrder.taxes?.amount || 0
         const totalAmount = mlOrder.total_amount || order.total_amount
-        const paidAmount = totalAmount - saleFeeTot - freteVendedor
+
+        // Tenta billing_info primeiro
+        let saleFeeLiquido, freteVendedor, bonusCampanha
+        const billing = await calcCustosReaisML(order.ml_order_id, token)
+        if (billing) {
+          saleFeeLiquido = billing.saleFeeLiquido
+          freteVendedor = billing.freteVendedor
+          bonusCampanha = billing.bonusCampanha
+        } else {
+          // Fallback: usa paid_amount da API do ML
+          const paidAmountML = mlOrder.payments?.[0]?.total_paid_amount || mlOrder.paid_amount || 0
+          const custoTotal = totalAmount - paidAmountML
+          saleFeeLiquido = mlOrder.order_items?.reduce((s,i) => s + (i.sale_fee || 0), 0) || order.sale_fee || 0
+          freteVendedor = Math.max(0, custoTotal - saleFeeLiquido)
+          bonusCampanha = 0
+        }
+
+        const paidAmount = totalAmount - saleFeeLiquido - freteVendedor + bonusCampanha
+        const taxesAmount = mlOrder.taxes?.amount || 0
 
         await sb.from('ml_orders').update({
-          sale_fee: saleFeeTot,
+          sale_fee: saleFeeLiquido,
           shipping_cost_ml: freteVendedor,
           paid_amount: paidAmount,
           taxes_amount: taxesAmount,
@@ -617,8 +625,8 @@ app.post('/api/recalcular-custos', async (req, res) => {
           updated_at: new Date().toISOString()
         }).eq('id', order.id)
         fixed++
-        console.log(`✅ ${order.ml_order_id}: frete=${freteVendedor} paid=${paidAmount}`)
-        await new Promise(r => setTimeout(r, 500))
+        console.log(`✅ ${order.ml_order_id}: fee=${saleFeeLiquido} frete=${freteVendedor} bonus=${bonusCampanha} paid=${paidAmount}`)
+        await new Promise(r => setTimeout(r, 600))
       } catch (e) {
         console.log(`❌ Erro em ${order.ml_order_id}: ${e.message}`)
       }
@@ -671,7 +679,7 @@ app.post('/api/reclassify-all', async (req, res) => {
 })
 
 app.get('/', (req, res) => res.json({
-  status: '🚀 TMP10 Backend v8.0 — Frete líquido corrigido',
+  status: '🚀 TMP10 Backend v9.0 — billing_info corrigido',
   uptime: Math.floor(process.uptime()) + 's',
   sync_interval: '2 minutos',
   delivery_check: '15 minutos'
@@ -760,7 +768,7 @@ app.post('/api/ml/import-products', async (req, res) => {
 
 const PORT = process.env.PORT || 3001
 app.listen(PORT, () => {
-  console.log(`🚀 TMP10 v8.0 porta ${PORT}`)
+  console.log(`🚀 TMP10 v9.0 porta ${PORT}`)
   setTimeout(syncAll, 3000)
   setTimeout(reclassifyOrders, 10000)
   setTimeout(checkDeliveries, 20000)
