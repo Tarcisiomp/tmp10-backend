@@ -223,7 +223,8 @@ async function syncMLOrders(account) {
               thumbnail: item.item.thumbnail
             }))
 
-            // ✅ v9.3: Busca frete direto do /shipments/{id} via list_cost
+            // ✅ v9.5: totalAmount declarado corretamente
+            const totalAmount = order.total_amount || 0
             const saleFeeTot = order.order_items?.reduce((s,i) => s + (i.sale_fee || 0), 0) || 0
             const taxesAmount = order.taxes?.amount || 0
             const shipmentId = order.shipping?.id ? String(order.shipping.id) : null
@@ -640,7 +641,7 @@ app.post('/api/recalcular-custos', async (req, res) => {
           updated_at: new Date().toISOString()
         }).eq('id', order.id)
         fixed++
-        console.log(`✅ ${order.ml_order_id}: fee=${saleFeeLiquido} frete=${freteVendedor} bonus=${bonusCampanha} paid=${paidAmount}`)
+        console.log(`✅ ${order.ml_order_id}: fee=${saleFeeLiquido} frete=${freteVendedor} paid=${paidAmount}`)
         await new Promise(r => setTimeout(r, 600))
       } catch (e) {
         console.log(`❌ Erro em ${order.ml_order_id}: ${e.message}`)
@@ -694,7 +695,7 @@ app.post('/api/reclassify-all', async (req, res) => {
 })
 
 app.get('/', (req, res) => res.json({
-  status: '🚀 TMP10 Backend v9.4 — token por conta',
+  status: '🚀 TMP10 Backend v9.5 — bugs sync corrigidos',
   uptime: Math.floor(process.uptime()) + 's',
   sync_interval: '2 minutos',
   delivery_check: '15 minutos'
@@ -783,7 +784,7 @@ app.post('/api/ml/import-products', async (req, res) => {
 
 const PORT = process.env.PORT || 3001
 app.listen(PORT, () => {
-  console.log(`🚀 TMP10 v9.4 porta ${PORT}`)
+  console.log(`🚀 TMP10 v9.5 porta ${PORT}`)
   setTimeout(syncAll, 3000)
   setTimeout(reclassifyOrders, 10000)
   setTimeout(checkDeliveries, 20000)
