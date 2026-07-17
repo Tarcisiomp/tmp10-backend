@@ -467,30 +467,71 @@ async function syncPerguntas() {
   }
 }
 
-// ── Sync Estoque ML ───────────────────────────────────────────────
+// ── Sync Estoque ML (multi-conta, somado por empresa+SKU) ─────────
+// Relê a quantidade de cada anúncio já vinculado em product_ml_links
+// (usando o token da conta dona do anúncio) e depois soma tudo por
+// empresa_id+sku, gravando o total em products.estoque_atual.
 async function syncEstoqueML() {
   try {
-    const { data: prods } = await sb.from('products').select('id,ml_item_id,sku').not('ml_item_id', 'is', null)
-    if (!prods?.length) return
+    const { data: links } = await sb.from('product_ml_links').select('*')
+    if (!links?.length) {
+      console.log('ℹ️ Nenhum anúncio vinculado ainda em product_ml_links (rode "Importar Produtos do ML")')
+      return
+    }
     const { data: accounts } = await sb.from('ml_accounts').select('*').eq('active', true)
-    if (!accounts?.length) return
-    const token = await getToken(accounts[0])
-    if (!token) return
+    const accByNick = {}
+    for (const acc of accounts || []) accByNick[acc.nickname] = acc
 
-    for (const prod of prods) {
-      try {
-        const { data: item } = await axios.get(
-          `https://api.mercadolibre.com/items/${prod.ml_item_id}`,
-          { headers: { Authorization: `Bearer ${token}` }, timeout: 5000 }
-        )
-        const estoque = item.available_quantity || 0
-        await sb.from('products').update({ estoque_atual: estoque, updated_at: new Date().toISOString() }).eq('id', prod.id)
-        await new Promise(r => setTimeout(r, 200))
-      } catch (e) {
-        console.log(`Erro estoque ${prod.sku}: ${e.message}`)
+    const byAccount = {}
+    for (const link of links) {
+      if (!byAccount[link.account_nickname]) byAccount[link.account_nickname] = []
+      byAccount[link.account_nickname].push(link)
+    }
+
+    for (const [nickname, accLinks] of Object.entries(byAccount)) {
+      const account = accByNick[nickname]
+      if (!account) continue
+      const token = await getToken(account)
+      if (!token) continue
+
+      for (let i = 0; i < accLinks.length; i += 20) {
+        const batch = accLinks.slice(i, i + 20)
+        const ids = batch.map(l => l.ml_item_id).join(',')
+        try {
+          const { data } = await axios.get(
+            `https://api.mercadolibre.com/items?ids=${ids}`,
+            { headers: { Authorization: `Bearer ${token}` }, timeout: 8000 }
+          )
+          for (const entry of data || []) {
+            if (entry.code !== 200) continue
+            const item = entry.body
+            const link = batch.find(l => l.ml_item_id === String(item.id))
+            if (!link) continue
+            await sb.from('product_ml_links')
+              .update({ quantity: item.available_quantity || 0, updated_at: new Date().toISOString() })
+              .eq('id', link.id)
+          }
+        } catch (e) {
+          console.log(`Erro estoque lote (${nickname}): ${e.message}`)
+        }
+        await new Promise(r => setTimeout(r, 300))
       }
     }
-    console.log('✅ Sync estoque ML concluído')
+
+    const { data: fresh } = await sb.from('product_ml_links').select('empresa_id,sku,quantity')
+    const totals = {}
+    for (const l of fresh || []) {
+      const key = `${l.empresa_id}::${l.sku}`
+      totals[key] = (totals[key] || 0) + (l.quantity || 0)
+    }
+    for (const [key, total] of Object.entries(totals)) {
+      const [empresa_id, sku] = key.split('::')
+      await sb.from('products')
+        .update({ estoque_atual: total, updated_at: new Date().toISOString() })
+        .eq('empresa_id', empresa_id).eq('sku', sku)
+    }
+
+    console.log(`✅ Sync estoque ML concluído (${links.length} anúncios, ${Object.keys(totals).length} produtos atualizados)`)
   } catch (e) {
     console.log('Erro sync estoque:', e.message)
   }
@@ -891,32 +932,85 @@ app.get('/api/stats', async (req, res) => {
 app.post('/api/ml/import-products', async (req, res) => {
   const { data: accounts } = await sb.from('ml_accounts').select('*').eq('active', true)
   let imported = 0
+  let linked = 0
+
   for (const acc of accounts || []) {
     try {
       const token = await getToken(acc)
-      const { data } = await axios.get(
-        `https://api.mercadolibre.com/users/${acc.ml_user_id}/items/search?limit=100`,
-        { headers: { Authorization: `Bearer ${token}` } }
-      )
-      for (const itemId of data.results || []) {
+      let scrollId = null
+      let allIds = []
+
+      // Busca TODOS os anúncios ativos da conta (não só os 100 primeiros)
+      do {
+        const url = scrollId
+          ? `https://api.mercadolibre.com/users/${acc.ml_user_id}/items/search?search_type=scan&scroll_id=${scrollId}`
+          : `https://api.mercadolibre.com/users/${acc.ml_user_id}/items/search?search_type=scan`
+        const { data } = await axios.get(url, { headers: { Authorization: `Bearer ${token}` } })
+        allIds = allIds.concat(data.results || [])
+        scrollId = data.scroll_id
+        if (!data.results?.length) break
+      } while (scrollId && allIds.length < 2000)
+
+      // Busca detalhes em lotes de 20 (multiget)
+      for (let i = 0; i < allIds.length; i += 20) {
+        const batchIds = allIds.slice(i, i + 20)
         try {
-          const { data: item } = await axios.get(
-            `https://api.mercadolibre.com/items/${itemId}`,
+          const { data: items } = await axios.get(
+            `https://api.mercadolibre.com/items?ids=${batchIds.join(',')}`,
             { headers: { Authorization: `Bearer ${token}` } }
           )
-          await sb.from('products').upsert({
-            sku: String(item.seller_sku || item.id),
-            name: item.title,
-            photo: item.thumbnail ? item.thumbnail.replace('-I.jpg', '-O.jpg').replace('http://', 'https://') : null,
-            active: true,
-            source: 'mercadolivre'
-          }, { onConflict: 'sku' })
-          imported++
-        } catch (e) {}
+          for (const entry of items || []) {
+            if (entry.code !== 200) continue
+            const item = entry.body
+            const sku = String(item.seller_sku || item.id)
+
+            await sb.from('products').upsert({
+              sku,
+              empresa_id: acc.empresa_id || null,
+              name: item.title,
+              photo: item.thumbnail ? item.thumbnail.replace('-I.jpg', '-O.jpg').replace('http://', 'https://') : null,
+              active: true,
+              source: 'mercadolivre',
+              estoque_atual: item.available_quantity || 0
+            }, { onConflict: 'empresa_id,sku', ignoreDuplicates: false })
+            imported++
+
+            await sb.from('product_ml_links').upsert({
+              empresa_id: acc.empresa_id || null,
+              sku,
+              account_nickname: acc.nickname,
+              ml_item_id: String(item.id),
+              ml_user_id: acc.ml_user_id,
+              quantity: item.available_quantity || 0,
+              updated_at: new Date().toISOString()
+            }, { onConflict: 'account_nickname,ml_item_id' })
+            linked++
+          }
+        } catch (e) {
+          console.log(`Erro lote import (${acc.nickname}): ${e.message}`)
+        }
+        await new Promise(r => setTimeout(r, 300))
       }
-    } catch (e) {}
+    } catch (e) {
+      console.log(`Erro import-products (${acc.nickname}): ${e.message}`)
+    }
   }
-  res.json({ imported })
+
+  // Depois de importar tudo, soma o estoque de todas as contas por SKU
+  const { data: fresh } = await sb.from('product_ml_links').select('empresa_id,sku,quantity')
+  const totals = {}
+  for (const l of fresh || []) {
+    const key = `${l.empresa_id}::${l.sku}`
+    totals[key] = (totals[key] || 0) + (l.quantity || 0)
+  }
+  for (const [key, total] of Object.entries(totals)) {
+    const [empresa_id, sku] = key.split('::')
+    await sb.from('products')
+      .update({ estoque_atual: total })
+      .eq('empresa_id', empresa_id).eq('sku', sku)
+  }
+
+  res.json({ imported, linked, produtos_com_estoque_somado: Object.keys(totals).length })
 })
 
 const PORT = process.env.PORT || 3001
