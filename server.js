@@ -965,7 +965,9 @@ async function rodarImportProducts() {
             for (const entry of items || []) {
               if (entry.code !== 200) continue
               const item = entry.body
-              const sku = String(item.seller_sku || item.id)
+              const skuAttr = (item.attributes || []).find(a => a.id === 'SELLER_SKU')
+              const skuReal = skuAttr?.value_name || item.seller_custom_field || null
+              const sku = String(skuReal || item.id)
 
               await sb.from('products').upsert({
                 sku,
