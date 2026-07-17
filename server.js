@@ -17,16 +17,22 @@ const sb = createClient(
 const ML_CLIENT_ID     = process.env.ML_CLIENT_ID     || '4022957335913783'
 const ML_CLIENT_SECRET = process.env.ML_CLIENT_SECRET || 'f9jB9yc6UvrAnz4kjT6u02xMxjbvn7z3'
 const RAILWAY_URL      = 'https://web-production-82c10.up.railway.app'
+const ERP_URL          = process.env.ERP_URL || 'https://roaring-pixie-c02520.netlify.app'
 
 // ── Auth ──────────────────────────────────────────────────────────
+// state carrega "accountId:empresaId" pra sabermos, no callback, de qual
+// empresa (cliente) é essa conexão — sem isso a conta ML fica sem dono.
 app.get('/ml/auth/:accountId', (req, res) => {
+  const empresaId = req.query.empresa_id || ''
   const redirectUri = `${RAILWAY_URL}/ml/callback`
-  const url = `https://auth.mercadolivre.com.br/authorization?response_type=code&client_id=${ML_CLIENT_ID}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${req.params.accountId}`
+  const state = `${req.params.accountId}:${empresaId}`
+  const url = `https://auth.mercadolivre.com.br/authorization?response_type=code&client_id=${ML_CLIENT_ID}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${encodeURIComponent(state)}`
   res.redirect(url)
 })
 
 app.get('/ml/callback', async (req, res) => {
-  const { code, state: accountId } = req.query
+  const { code, state } = req.query
+  const [accountId, empresaId] = String(state || '').split(':')
   try {
     const { data: tok } = await axios.post('https://api.mercadolibre.com/oauth/token', {
       grant_type: 'authorization_code',
@@ -41,6 +47,7 @@ app.get('/ml/callback', async (req, res) => {
     )
     await sb.from('ml_accounts').upsert({
       account_id: accountId,
+      empresa_id: empresaId || null,
       ml_user_id: String(tok.user_id),
       nickname: userInfo.nickname,
       access_token: tok.access_token,
@@ -48,11 +55,11 @@ app.get('/ml/callback', async (req, res) => {
       expires_at: new Date(Date.now() + tok.expires_in * 1000).toISOString(),
       active: true
     }, { onConflict: 'ml_user_id' })
-    await syncMLOrders({ ml_user_id: String(tok.user_id), access_token: tok.access_token, nickname: userInfo.nickname })
-    res.redirect(`https://tmp10.com.br?ml_connected=true&nickname=${userInfo.nickname}`)
+    await syncMLOrders({ ml_user_id: String(tok.user_id), access_token: tok.access_token, nickname: userInfo.nickname, empresa_id: empresaId || null })
+    res.redirect(`${ERP_URL}?ml_connected=true&nickname=${userInfo.nickname}`)
   } catch (e) {
     console.error('Auth error:', e.response?.data || e.message)
-    res.redirect(`https://tmp10.com.br?ml_error=true`)
+    res.redirect(`${ERP_URL}?ml_error=true`)
   }
 })
 
@@ -250,6 +257,7 @@ async function syncMLOrders(account) {
 
             await sb.from('ml_orders').insert({
               ml_order_id: String(order.id),
+              empresa_id: account.empresa_id || null,
               account_nickname: account.nickname,
               buyer_name: order.buyer?.nickname || order.buyer?.full_name || 'Cliente',
               status,
@@ -273,6 +281,7 @@ async function syncMLOrders(account) {
                 if (item.sku) {
                   await sb.from('products').upsert({
                     sku: String(item.sku),
+                    empresa_id: account.empresa_id || null,
                     name: item.name,
                     description: `ML - ${account.nickname}`,
                     photo: item.thumbnail ? item.thumbnail.replace('-I.jpg', '-O.jpg').replace('http://', 'https://') : null,
