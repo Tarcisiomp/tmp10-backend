@@ -705,11 +705,12 @@ app.post('/api/reclassify-all', async (req, res) => {
   })()
 })
 
-app.all('/api/backfill-tracking', async (req, res) => {
+let backfillStatus = { running: false, corrigidos: 0, erros: 0, total: 0, terminadoEm: null }
+
+async function rodarBackfillTracking() {
+  backfillStatus = { running: true, corrigidos: 0, erros: 0, total: 0, terminadoEm: null }
   try {
     const { data: accounts } = await sb.from('ml_accounts').select('*').eq('active', true)
-    let corrigidos = 0
-    let erros = 0
 
     for (const account of accounts || []) {
       const token = await getToken(account)
@@ -720,6 +721,8 @@ app.all('/api/backfill-tracking', async (req, res) => {
         .not('shipment_id', 'is', null)
         .limit(500)
 
+      backfillStatus.total += (orders || []).length
+
       for (const order of orders || []) {
         try {
           const { data: shipData } = await axios.get(
@@ -728,17 +731,31 @@ app.all('/api/backfill-tracking', async (req, res) => {
           )
           if (shipData.tracking_number) {
             await sb.from('ml_orders').update({ tracking_number: shipData.tracking_number }).eq('id', order.id)
-            corrigidos++
+            backfillStatus.corrigidos++
           }
         } catch (e) {
-          erros++
+          backfillStatus.erros++
         }
       }
     }
-    res.json({ ok: true, corrigidos, erros })
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message })
+    console.log('Erro no backfill:', e.message)
+  } finally {
+    backfillStatus.running = false
+    backfillStatus.terminadoEm = new Date().toISOString()
   }
+}
+
+app.all('/api/backfill-tracking', (req, res) => {
+  if (backfillStatus.running) {
+    return res.json({ ok: true, message: 'Já está rodando, confere o progresso em /api/backfill-tracking/status', status: backfillStatus })
+  }
+  rodarBackfillTracking() // não aguarda — roda em segundo plano
+  res.json({ ok: true, message: 'Iniciado em segundo plano. Confere o progresso em /api/backfill-tracking/status' })
+})
+
+app.get('/api/backfill-tracking/status', (req, res) => {
+  res.json(backfillStatus)
 })
 
 app.get('/', (req, res) => res.json({
