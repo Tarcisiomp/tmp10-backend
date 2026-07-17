@@ -705,7 +705,7 @@ app.post('/api/reclassify-all', async (req, res) => {
   })()
 })
 
-app.post('/api/backfill-tracking', async (req, res) => {
+app.all('/api/backfill-tracking', async (req, res) => {
   try {
     const { data: accounts } = await sb.from('ml_accounts').select('*').eq('active', true)
     let corrigidos = 0
