@@ -214,86 +214,91 @@ async function syncMLOrders(account) {
           const total = data.paging?.total || 0
 
           for (const order of results) {
-            const { data: existing } = await sb.from('ml_orders')
-              .select('id').eq('ml_order_id', String(order.id)).maybeSingle()
-            if (existing) continue
+            try {
+              const { data: existing } = await sb.from('ml_orders')
+                .select('id').eq('ml_order_id', String(order.id)).maybeSingle()
+              if (existing) continue
 
-            const orderType = await detectOrderType(order, token)
-            const isFull = orderType === 'FULL'
-            const status = isFull ? 'full_ml' : 'aguardando'
+              const orderType = await detectOrderType(order, token)
+              const isFull = orderType === 'FULL'
+              const status = isFull ? 'full_ml' : 'aguardando'
 
-            const items = order.order_items.map(item => ({
-              sku: item.item.seller_sku || item.item.id,
-              name: item.item.title,
-              qty: item.quantity,
-              ml_item_id: item.item.id,
-              thumbnail: item.item.thumbnail
-            }))
+              const items = order.order_items.map(item => ({
+                sku: item.item.seller_sku || item.item.id,
+                name: item.item.title,
+                qty: item.quantity,
+                ml_item_id: item.item.id,
+                thumbnail: item.item.thumbnail
+              }))
 
-            // ✅ v9.5: totalAmount declarado corretamente
-            const totalAmount = order.total_amount || 0
-            const saleFeeTot = order.order_items?.reduce((s,i) => s + (i.sale_fee || 0), 0) || 0
-            const taxesAmount = order.taxes?.amount || 0
-            const shipmentId = order.shipping?.id ? String(order.shipping.id) : null
+              // ✅ v9.5: totalAmount declarado corretamente
+              const totalAmount = order.total_amount || 0
+              const saleFeeTot = order.order_items?.reduce((s,i) => s + (i.sale_fee || 0), 0) || 0
+              const taxesAmount = order.taxes?.amount || 0
+              const shipmentId = order.shipping?.id ? String(order.shipping.id) : null
 
-            // Busca frete real do shipment (e o código de rastreio pra bipagem)
-            let freteVendedor = 0
-            let trackingNumber = null
-            if (shipmentId && token) {
-              try {
-                const { data: shipData } = await axios.get(
-                  `https://api.mercadolibre.com/shipments/${shipmentId}`,
-                  { headers: { Authorization: `Bearer ${token}` }, timeout: 5000 }
-                )
-                // list_cost = custo total do frete cobrado do vendedor
-                freteVendedor = shipData.shipping_option?.list_cost || shipData.cost?.sender?.cost || 0
-                trackingNumber = shipData.tracking_number || null
-                console.log(`  Frete shipment ${shipmentId}: ${freteVendedor} | rastreio: ${trackingNumber}`)
-              } catch(e) {
-                console.log(`  Erro frete ${shipmentId}: ${e.message}`)
-              }
-            }
-
-            const saleFeeLiquido = saleFeeTot
-            const paidAmount = totalAmount - saleFeeLiquido - freteVendedor
-
-            await sb.from('ml_orders').insert({
-              ml_order_id: String(order.id),
-              empresa_id: account.empresa_id || null,
-              account_nickname: account.nickname,
-              buyer_name: order.buyer?.nickname || order.buyer?.full_name || 'Cliente',
-              status,
-              order_type: orderType,
-              is_fulfillment: isFull,
-              items,
-              ml_status: mlStatus,
-              shipment_id: shipmentId,
-              tracking_number: trackingNumber,
-              created_at_ml: order.date_created,
-              total_amount: totalAmount,
-              paid_amount: paidAmount,
-              sale_fee: saleFeeLiquido,
-              shipping_cost_ml: freteVendedor,
-              taxes_amount: taxesAmount
-            })
-
-            // Auto cadastra produto (apenas nao-FULL)
-            if (!isFull) {
-              for (const item of items) {
-                if (item.sku) {
-                  await sb.from('products').upsert({
-                    sku: String(item.sku),
-                    empresa_id: account.empresa_id || null,
-                    name: item.name,
-                    description: `ML - ${account.nickname}`,
-                    photo: item.thumbnail ? item.thumbnail.replace('-I.jpg', '-O.jpg').replace('http://', 'https://') : null,
-                    active: true,
-                    source: 'mercadolivre'
-                  }, { onConflict: 'sku', ignoreDuplicates: true })
+              // Busca frete real do shipment (e o código de rastreio pra bipagem)
+              let freteVendedor = 0
+              let trackingNumber = null
+              if (shipmentId && token) {
+                try {
+                  const { data: shipData } = await axios.get(
+                    `https://api.mercadolibre.com/shipments/${shipmentId}`,
+                    { headers: { Authorization: `Bearer ${token}` }, timeout: 5000 }
+                  )
+                  // list_cost = custo total do frete cobrado do vendedor
+                  freteVendedor = shipData.shipping_option?.list_cost || shipData.cost?.sender?.cost || 0
+                  trackingNumber = shipData.tracking_number || null
+                  console.log(`  Frete shipment ${shipmentId}: ${freteVendedor} | rastreio: ${trackingNumber}`)
+                } catch(e) {
+                  console.log(`  Erro frete ${shipmentId}: ${e.message}`)
                 }
               }
+
+              const saleFeeLiquido = saleFeeTot
+              const paidAmount = totalAmount - saleFeeLiquido - freteVendedor
+
+              await sb.from('ml_orders').insert({
+                ml_order_id: String(order.id),
+                empresa_id: account.empresa_id || null,
+                account_nickname: account.nickname,
+                buyer_name: order.buyer?.nickname || order.buyer?.full_name || 'Cliente',
+                status,
+                order_type: orderType,
+                is_fulfillment: isFull,
+                items,
+                ml_status: mlStatus,
+                shipment_id: shipmentId,
+                tracking_number: trackingNumber,
+                created_at_ml: order.date_created,
+                total_amount: totalAmount,
+                paid_amount: paidAmount,
+                sale_fee: saleFeeLiquido,
+                shipping_cost_ml: freteVendedor,
+                taxes_amount: taxesAmount
+              })
+
+              // Auto cadastra produto (apenas nao-FULL)
+              if (!isFull) {
+                for (const item of items) {
+                  if (item.sku) {
+                    await sb.from('products').upsert({
+                      sku: String(item.sku),
+                      empresa_id: account.empresa_id || null,
+                      name: item.name,
+                      description: `ML - ${account.nickname}`,
+                      photo: item.thumbnail ? item.thumbnail.replace('-I.jpg', '-O.jpg').replace('http://', 'https://') : null,
+                      active: true,
+                      source: 'mercadolivre'
+                    }, { onConflict: 'sku', ignoreDuplicates: true })
+                  }
+                }
+              }
+              totalNew++
+            } catch (orderErr) {
+              // Um pedido com problema não pode derrubar o lote inteiro — loga e segue pro próximo
+              console.error(`  ⚠️ Pedido ${order.id} falhou (${account.nickname}): ${orderErr.message}`)
             }
-            totalNew++
           }
 
           if (results.length < 50 || offset + 50 >= total) {
