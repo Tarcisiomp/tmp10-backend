@@ -501,6 +501,7 @@ cron.schedule('*/2 * * * *', syncAll)
 cron.schedule('*/30 * * * *', syncEstoqueML)
 cron.schedule('*/15 * * * *', checkDeliveries)
 cron.schedule('*/5 * * * *', syncPerguntas)
+cron.schedule('*/10 * * * *', recalcularPedidosRecentesAutomatico)
 
 // ── Webhook ML ────────────────────────────────────────────────────
 app.post('/ml/notifications', async (req, res) => {
@@ -585,6 +586,73 @@ app.post('/api/sync-estoque', async (req, res) => {
 })
 
 // ✅ v9.0: Recalcular custos usando billing_info (correto) + fallback paid_amount
+// Recalcula automaticamente pedidos recentes que sincronizaram com taxa zerada
+// (comum: ML ainda não tinha fechado a comissão no momento da sincronização inicial)
+async function recalcularPedidosRecentesAutomatico() {
+  try {
+    const desde = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString() // últimas 12h
+    const { data: orders } = await sb.from('ml_orders')
+      .select('id, ml_order_id, shipment_id, sale_fee, total_amount, account_nickname, tracking_number')
+      .eq('sale_fee', 0)
+      .gt('created_at_ml', desde)
+      .not('status', 'in', '(cancelado)')
+      .limit(50)
+
+    if (!orders?.length) return
+
+    const { data: accounts } = await sb.from('ml_accounts').select('*').eq('active', true)
+    const tokenMap = {}
+    for (const acc of accounts || []) tokenMap[acc.nickname] = await getToken(acc)
+
+    let corrigidos = 0
+    for (const order of orders) {
+      try {
+        const orderToken = tokenMap[order.account_nickname]
+        if (!orderToken) continue
+
+        const { data: mlOrder } = await axios.get(
+          `https://api.mercadolibre.com/orders/${order.ml_order_id}`,
+          { headers: { Authorization: `Bearer ${orderToken}` }, timeout: 8000 }
+        )
+        const saleFeeTot = mlOrder.order_items?.reduce((s,i) => s + (i.sale_fee || 0), 0) || 0
+        if (saleFeeTot === 0) continue // ML ainda não fechou, tenta de novo no próximo ciclo
+
+        const totalAmount = mlOrder.total_amount || order.total_amount
+        const taxesAmount = mlOrder.taxes?.amount || 0
+
+        let freteVendedor = 0
+        let trackingNumber = order.tracking_number
+        if (order.shipment_id) {
+          try {
+            const { data: shipData } = await axios.get(
+              `https://api.mercadolibre.com/shipments/${order.shipment_id}`,
+              { headers: { Authorization: `Bearer ${orderToken}` }, timeout: 5000 }
+            )
+            freteVendedor = shipData.shipping_option?.list_cost || shipData.cost?.sender?.cost || 0
+            trackingNumber = shipData.tracking_number || trackingNumber
+          } catch(e) {}
+        }
+
+        await sb.from('ml_orders').update({
+          sale_fee: saleFeeTot,
+          shipping_cost_ml: freteVendedor,
+          paid_amount: totalAmount - saleFeeTot - freteVendedor,
+          taxes_amount: taxesAmount,
+          total_amount: totalAmount,
+          tracking_number: trackingNumber
+        }).eq('id', order.id)
+        corrigidos++
+        await new Promise(r => setTimeout(r, 400))
+      } catch (e) {
+        console.log(`  Erro recalc automático ${order.ml_order_id}: ${e.message}`)
+      }
+    }
+    if (corrigidos > 0) console.log(`💰 ${corrigidos} pedido(s) tiveram taxa/frete/rastreio corrigidos automaticamente`)
+  } catch (e) {
+    console.log('Erro recalcularPedidosRecentesAutomatico:', e.message)
+  }
+}
+
 app.post('/api/recalcular-custos', async (req, res) => {
   const offset = parseInt(req.query.offset || '0')
   const limit = 30
