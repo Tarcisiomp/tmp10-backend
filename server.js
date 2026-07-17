@@ -1010,7 +1010,11 @@ app.post('/api/ml/import-products', async (req, res) => {
       .eq('empresa_id', empresa_id).eq('sku', sku)
   }
 
-  res.json({ imported, linked, produtos_com_estoque_somado: Object.keys(totals).length })
+  const produtosComEstoque = Object.keys(totals).length
+  res.json({
+    imported, linked, produtos_com_estoque_somado: produtosComEstoque,
+    message: `${imported} produtos importados, estoque somado em ${produtosComEstoque} produtos`
+  })
 })
 
 const PORT = process.env.PORT || 3001
