@@ -236,8 +236,9 @@ async function syncMLOrders(account) {
             const taxesAmount = order.taxes?.amount || 0
             const shipmentId = order.shipping?.id ? String(order.shipping.id) : null
 
-            // Busca frete real do shipment
+            // Busca frete real do shipment (e o código de rastreio pra bipagem)
             let freteVendedor = 0
+            let trackingNumber = null
             if (shipmentId && token) {
               try {
                 const { data: shipData } = await axios.get(
@@ -246,7 +247,8 @@ async function syncMLOrders(account) {
                 )
                 // list_cost = custo total do frete cobrado do vendedor
                 freteVendedor = shipData.shipping_option?.list_cost || shipData.cost?.sender?.cost || 0
-                console.log(`  Frete shipment ${shipmentId}: ${freteVendedor}`)
+                trackingNumber = shipData.tracking_number || null
+                console.log(`  Frete shipment ${shipmentId}: ${freteVendedor} | rastreio: ${trackingNumber}`)
               } catch(e) {
                 console.log(`  Erro frete ${shipmentId}: ${e.message}`)
               }
@@ -266,7 +268,7 @@ async function syncMLOrders(account) {
               items,
               ml_status: mlStatus,
               shipment_id: shipmentId,
-              tracking_number: null,
+              tracking_number: trackingNumber,
               created_at_ml: order.date_created,
               total_amount: totalAmount,
               paid_amount: paidAmount,
@@ -701,6 +703,42 @@ app.post('/api/reclassify-all', async (req, res) => {
     }
     console.log(`✅ Reclassificação: ${fixed} corrigidos de ${orders.length}`)
   })()
+})
+
+app.post('/api/backfill-tracking', async (req, res) => {
+  try {
+    const { data: accounts } = await sb.from('ml_accounts').select('*').eq('active', true)
+    let corrigidos = 0
+    let erros = 0
+
+    for (const account of accounts || []) {
+      const token = await getToken(account)
+      const { data: orders } = await sb.from('ml_orders')
+        .select('id, shipment_id')
+        .eq('empresa_id', account.empresa_id)
+        .is('tracking_number', null)
+        .not('shipment_id', 'is', null)
+        .limit(500)
+
+      for (const order of orders || []) {
+        try {
+          const { data: shipData } = await axios.get(
+            `https://api.mercadolibre.com/shipments/${order.shipment_id}`,
+            { headers: { Authorization: `Bearer ${token}` }, timeout: 5000 }
+          )
+          if (shipData.tracking_number) {
+            await sb.from('ml_orders').update({ tracking_number: shipData.tracking_number }).eq('id', order.id)
+            corrigidos++
+          }
+        } catch (e) {
+          erros++
+        }
+      }
+    }
+    res.json({ ok: true, corrigidos, erros })
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message })
+  }
 })
 
 app.get('/', (req, res) => res.json({
