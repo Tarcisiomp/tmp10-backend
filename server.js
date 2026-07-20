@@ -96,7 +96,44 @@ app.post('/api/push/notificar-venda', async (req, res) => {
   }
 })
 
+// Manda uma notificação de aviso pra um vendedor específico ou pra todos (usado no "Avisar Vendedores")
+app.post('/api/push/notificar-mensagem', async (req, res) => {
+  try {
+    const { empresa_id, titulo, mensagem, user_ids } = req.body
+    if (!empresa_id || !mensagem) return res.status(400).json({ error: 'empresa_id e mensagem são obrigatórios' })
 
+    let query = sb.from('push_subscriptions').select('*').eq('empresa_id', empresa_id)
+    if (Array.isArray(user_ids) && user_ids.length > 0) {
+      query = query.in('user_id', user_ids)
+    }
+    const { data: subs, error } = await query
+    if (error) return res.status(500).json({ error: error.message })
+
+    const payload = JSON.stringify({
+      title: titulo || '📢 Aviso',
+      body: mensagem,
+      tag: 'aviso-equipe'
+    })
+
+    let enviados = 0
+    for (const s of (subs || [])) {
+      try {
+        await webpush.sendNotification({
+          endpoint: s.endpoint,
+          keys: { p256dh: s.p256dh, auth: s.auth }
+        }, payload)
+        enviados++
+      } catch (err) {
+        if (err.statusCode === 404 || err.statusCode === 410) {
+          await sb.from('push_subscriptions').delete().eq('endpoint', s.endpoint)
+        }
+      }
+    }
+    res.json({ ok: true, enviados })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
 
 // ── Auth ──────────────────────────────────────────────────────────
 // state carrega "accountId:empresaId" pra sabermos, no callback, de qual
