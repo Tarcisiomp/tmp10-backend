@@ -996,7 +996,11 @@ app.get('/', (req, res) => res.json({
 }))
 
 app.get('/api/ml/accounts', async (req, res) => {
-  const { data } = await sb.from('ml_accounts').select('id,nickname,active,created_at').eq('active', true)
+  const { empresa_id } = req.query
+  if (!empresa_id) {
+    return res.status(400).json({ error: 'empresa_id é obrigatório' })
+  }
+  const { data } = await sb.from('ml_accounts').select('id,nickname,active,created_at').eq('active', true).eq('empresa_id', empresa_id)
   res.json(data || [])
 })
 
@@ -1047,10 +1051,10 @@ app.get('/api/stats', async (req, res) => {
 
 let importStatus = { running: false, imported: 0, linked: 0, produtos_com_estoque_somado: 0, contaAtual: null, terminadoEm: null, erro: null }
 
-async function rodarImportProducts() {
+async function rodarImportProducts(empresa_id) {
   importStatus = { running: true, imported: 0, linked: 0, produtos_com_estoque_somado: 0, contaAtual: null, terminadoEm: null, erro: null }
   try {
-    const { data: accounts } = await sb.from('ml_accounts').select('*').eq('active', true)
+    const { data: accounts } = await sb.from('ml_accounts').select('*').eq('active', true).eq('empresa_id', empresa_id)
 
     for (const acc of accounts || []) {
       importStatus.contaAtual = acc.nickname
@@ -1142,10 +1146,14 @@ async function rodarImportProducts() {
 }
 
 app.post('/api/ml/import-products', (req, res) => {
+  const { empresa_id } = req.body
+  if (!empresa_id) {
+    return res.status(400).json({ ok: false, error: 'empresa_id é obrigatório — não é permitido importar sem saber de qual empresa é o pedido.' })
+  }
   if (importStatus.running) {
     return res.json({ ok: true, message: 'Já está rodando, confere o progresso em /api/ml/import-products/status', status: importStatus })
   }
-  rodarImportProducts() // não aguarda — roda em segundo plano
+  rodarImportProducts(empresa_id) // não aguarda — roda em segundo plano
   res.json({ ok: true, message: 'Importação iniciada em segundo plano. Isso pode levar alguns minutos.' })
 })
 
