@@ -761,6 +761,30 @@ function DiarioIA({ diario }) {
 }
 
 /* ---------------------- Painel principal ---------------------- */
+class LimiteDeErro extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { comErro: false };
+  }
+  static getDerivedStateFromError() {
+    return { comErro: true };
+  }
+  componentDidCatch(erro, info) {
+    console.error("Erro capturado pelo LimiteDeErro:", erro, info);
+  }
+  render() {
+    if (this.state.comErro) {
+      return (
+        <div className="card" style={{border:"1px solid #e5484d"}}>
+          <div style={{color:"#e5484d", fontWeight:600, marginBottom:6}}>Essa seção não conseguiu carregar</div>
+          <div style={{fontSize:13, color:"var(--text-dim)"}}>O resto da página continua funcionando normalmente. Recarregar a página costuma resolver.</div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 function Painel({ onSair }) {
   const [status, setStatus] = useState(null);
   const [decisaoAtual, setDecisaoAtual] = useState(null);
@@ -915,16 +939,16 @@ function Painel({ onSair }) {
         <DiarioIA diario={diario} />
 
         <div className="section-title">Configurações</div>
-        <PainelConfiguracoes config={config} onSalvar={salvarConfig} />
+        <LimiteDeErro><PainelConfiguracoes config={config} onSalvar={salvarConfig} /></LimiteDeErro>
 
         <div className="section-title" style={{marginTop:32}}>Configuração de Estratégia (contratos, alvos e stop em pontos)</div>
-        <ConfiguracaoEstrategia />
+        <LimiteDeErro><ConfiguracaoEstrategia /></LimiteDeErro>
 
         <div className="section-title" style={{marginTop:32}}>Configurações {'>'} Custos Operacionais</div>
-        <CustosOperacionais />
+        <LimiteDeErro><CustosOperacionais /></LimiteDeErro>
 
         <div className="section-title" style={{marginTop:32, borderTop:"2px solid var(--accent)", paddingTop:24}}>Módulo Financeiro e Impostos</div>
-        <ModuloFinanceiro />
+        <LimiteDeErro><ModuloFinanceiro /></LimiteDeErro>
 
       </div>
     </React.Fragment>
@@ -1001,7 +1025,8 @@ function ConfiguracaoEstrategia() {
         fetch(`${API_BASE_URL}/dashboard/estrategia/WIN`).then(r=>r.json()),
         fetch(`${API_BASE_URL}/dashboard/estrategia/WDO`).then(r=>r.json()),
       ]);
-      setConfigWin(win); setConfigWdo(wdo);
+      setConfigWin(win && Array.isArray(win.alvos_pontos) ? win : null);
+      setConfigWdo(wdo && Array.isArray(wdo.alvos_pontos) ? wdo : null);
     } catch (e) { console.error("Erro ao carregar configuração de estratégia", e); }
   }
   useEffect(() => { carregar(); }, []);
@@ -1164,7 +1189,8 @@ function CustosOperacionais() {
         fetch(`${API_BASE_URL}/custos-operacionais`).then(r=>r.json()),
         fetch(`${API_BASE_URL}/dashboard/corretora`).then(r=>r.json()),
       ]);
-      setCustos(lista); setCorretora(corr.corretora);
+      setCustos(Array.isArray(lista) ? lista : []);
+      setCorretora(corr && corr.corretora);
     } catch (e) { console.error("Erro ao carregar custos operacionais", e); }
   }
   useEffect(()=>{ carregar(); }, []);
