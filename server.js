@@ -193,8 +193,10 @@ async function refreshToken(account) {
       refresh_token: data.refresh_token,
       expires_at: new Date(Date.now() + data.expires_in * 1000).toISOString()
     }).eq('ml_user_id', account.ml_user_id)
+    console.log(`🔑 Token renovado com sucesso: ${account.nickname}`)
     return data.access_token
   } catch (e) {
+    console.error(`❌ FALHA ao renovar token de ${account.nickname}: ${e.response?.data ? JSON.stringify(e.response.data) : e.message}`)
     return account.access_token
   }
 }
